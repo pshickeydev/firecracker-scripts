@@ -128,6 +128,6 @@ fc-vm*.log                 # per-VM serial console logs
 
 ## Notes
 
-- The firecracker binary is installed to `/usr/local/bin/firecracker-<tag>-<arch>` with a stable `firecracker` symlink pointing at it. The scripts do not manage any other symlinks (e.g. a pre-existing `firecracker-v`).
+- The firecracker binary is installed to `/usr/local/bin/firecracker-<tag>-<arch>` with a stable `firecracker` symlink pointing at it.
 - Firecracker's serial console goes to `fc-vm<ID>.log` — `tail -f` it to watch boot. For interactive access, use SSH (the scripts launch firecracker detached with stdin from `/dev/null`, so the serial console is read-only by design).
-- Networking uses a hardcoded `172.16.0.0/24` range. If that collides with another network on your host, set `GUEST_IP`/`HOST_IP`/`TAP` by editing `start-vm.sh` or extending it to accept overrides.
+- Networking uses a hardcoded `172.16.0.0/24` range. Each VM's `/30` subnet and TAP name are derived from `VM_ID` inside `start-vm.sh` (`GUEST_IP`, `HOST_IP`, `TAP`, and the MAC are computed, not env-overridable). If the `172.16.0.0/24` range collides with another network on your host, edit the derivation in `start-vm.sh`.
