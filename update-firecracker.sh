@@ -150,7 +150,9 @@ update_images() {
   wget -q -O "$FC_DIR/ubuntu-$ubuntu_version.squashfs.upstream" "$S3/$ubuntu_key"
 
   echo "==> Unsquashing + patching SSH key + building ext4"
-  rm -rf "$FC_DIR/squashfs-root"
+  # The previous run chowned squashfs-root to root:root (for mkfs.ext4 -d), so a
+  # user-level rm can't delete it. Use sudo to clear it.
+  sudo rm -rf "$FC_DIR/squashfs-root"
   (cd "$FC_DIR" && unsquashfs "ubuntu-$ubuntu_version.squashfs.upstream" >/dev/null)
 
   # Use the dedicated guest keypair (generated if missing). Never touches ~/.ssh.
