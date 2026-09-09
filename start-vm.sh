@@ -35,7 +35,7 @@ VM_ID=$((10#$VM_ID))
 # API sockets live in FC_SOCKET_DIR (default /tmp); API_SOCKET overrides the full path.
 SOCKET_DIR="${FC_SOCKET_DIR:-/tmp}"
 API_SOCKET="${API_SOCKET:-$SOCKET_DIR/firecracker-vm${VM_ID}.sock}"
-LOG_FILE="${FC_DIR}/fc-vm${VM_ID}.log}"
+LOG_FILE="${FC_DIR}/fc-vm${VM_ID}.log"
 KERNEL="${KERNEL:-$FC_DIR/vmlinux-latest}"
 ROOTFS="${ROOTFS:-$FC_DIR/ubuntu-latest.ext4}"
 SSH_KEY="${SSH_KEY:-$FC_DIR/guest.id_rsa}"

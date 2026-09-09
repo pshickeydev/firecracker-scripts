@@ -42,3 +42,4 @@ release-v*/
 *.swp
 *.swo
 *~
+fc-vm*.log}
