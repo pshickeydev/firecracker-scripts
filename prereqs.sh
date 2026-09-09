@@ -44,6 +44,16 @@ check_kvm() {
   fi
 }
 
+# Optional checks report but don't gate: the core VM flow works without them.
+check_opt() { # cmd -- purpose
+  local cmd="$1" purpose="$2"
+  if command -v "$cmd" >/dev/null 2>&1; then
+    printf '  \033[32m✓\033[0m %-14s %s\n' "$cmd" "$purpose"
+  else
+    printf '  \033[33m!\033[0m %-14s %s (optional — not installed)\n' "$cmd" "$purpose"
+  fi
+}
+
 echo "Checking prerequisites for firecracker-scripts"
 echo
 echo "Commands:"
@@ -54,12 +64,22 @@ check_cmd ip           "TAP device + address setup"
 check_cmd nft          "NAT/masquerade rules (nftables)"
 check_cmd setsid       "detached firecracker launch"
 check_cmd ping         "guest reachability check"
+check_cmd pgrep        "process lookup (list-vms.sh / stop-vm.sh)"
+check_cmd pkill        "force-kill firecracker (stop-vm.sh)"
 check_cmd wget         "image downloads"
 check_cmd unsquashfs   "rootfs extraction (squashfs-tools)"
 check_cmd mkfs.ext4    "rootfs image build (e2fsprogs)"
 check_cmd ssh-keygen   "guest SSH keypair generation"
 check_cmd tar          "release archive extraction"
 check_cmd file         "image sanity check"
+echo
+# Agent-session extras (host-dir sharing + auth for in-VM Claude Code).
+echo "Agent-session extras (Claude Code in the guest):"
+check_cmd ssh         "run commands in the guest (share-dir.sh)"
+check_cmd exportfs    "NFS host-dir sharing (nfs-utils)"
+check_opt firewall-cmd "firewalld NFS port rules (firewalld)"
+check_opt getenforce  "SELinux state (Fedora)"
+check_opt go          'installs the `ant` CLI for Anthropic auth (auth-login.sh)'
 echo
 echo "Kernel + devices:"
 check_kvm
@@ -72,7 +92,8 @@ if [ "$FAIL" -gt 0 ]; then
   echo "Hints:"
   echo "  - install firecracker:     ./update-firecracker.sh binary"
   echo "  - fetch kernel + rootfs:  ./update-firecracker.sh images"
-  echo "  - on Fedora:              sudo dnf install squashfs-tools e2fsprogs nftables"
+  echo "  - build the agent image: ./update-firecracker.sh agent"
+  echo "  - on Fedora:              sudo dnf install squashfs-tools e2fsprogs nftables nfs-utils"
   echo "  - KVM access:             sudo usermod -aG kvm \$USER  (then re-login)"
   echo "  - TUN module:             sudo modprobe tun"
   exit 1

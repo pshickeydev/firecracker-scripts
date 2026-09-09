@@ -2,7 +2,6 @@
 # Kernels, rootfs images, and the extracted squashfs tree are all fetched or
 # built at runtime and never committed.
 vmlinux-*
-!vmlinux-latest
 ubuntu-*.ext4
 ubuntu-*.squashfs
 ubuntu-*.squashfs.upstream
@@ -23,6 +22,12 @@ guest.id_rsa
 guest.id_rsa.pub
 id_rsa
 id_rsa.pub
+
+# --- Secrets: Anthropic platform credentials minted by auth-login.sh (ant) ---
+# Contains live refresh tokens for the guest-dedicated 'fc-agents' profile.
+# Never commit; never scp into a VM (share it over NFS instead — one copy only,
+# because refresh tokens rotate on renewal).
+anthropic-config/
 
 # --- Runtime logs and per-VM state ---
 fc.log

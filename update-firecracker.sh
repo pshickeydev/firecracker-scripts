@@ -4,11 +4,14 @@
 # Usage:
 #   ./update-firecracker.sh binary     # update the firecracker binary from GitHub Releases
 #   ./update-firecracker.sh images     # update the guest kernel + Ubuntu rootfs from the CI S3 bucket
-#   ./update-firecracker.sh all        # do both (default)
+#   ./update-firecracker.sh agent       # turn the extracted rootfs into an agent image
+#                                      # (DNS fix, git/rg/nfs-common, Claude Code, 2 GiB ext4)
+#   ./update-firecracker.sh all        # binary + images (default)
 #   ./update-firecracker.sh images --force   # rebuild the rootfs even if versions match
 #
 # The binary update installs to /usr/local/bin and needs sudo.
 # The image update writes to this repo's dir and needs sudo for mkfs.ext4/chown.
+# The agent step chroots into the extracted rootfs and needs sudo for mounts/chroot.
 #
 # Images, keys, and logs are all kept inside FC_DIR (this repo) and are
 # .gitignored — nothing here touches ~/.ssh or personal keys.
@@ -79,6 +82,179 @@ ensure_guest_key() {
     ssh-keygen -q -f "$SSH_KEY" -N "" -C "firecracker-guest"
     chmod 600 "$SSH_KEY"
   fi
+}
+
+# --- agent subcommand ---------------------------------------------------------
+# Turns squashfs-root/ (from the `images` step) into an image ready for agent
+# sessions: working DNS, git + nfs-common via apt, a static ripgrep binary, the
+# stable Claude Code binary, and a 2 GiB rootfs so guest-side installs have
+# headroom.
+AGENT_APT_PKGS=(git nfs-common)
+AGENT_ROOT=""  # global: the EXIT trap below must not reference locals
+
+agent_umount_binds() {
+  # Drop any /proc /dev /sys bind-mounts left in the guest tree (a previous
+  # crashed run counts too: they would leak the host's /proc into the image).
+  [ -n "$AGENT_ROOT" ] && [ -d "$AGENT_ROOT" ] || return 0
+  sudo umount "$AGENT_ROOT/proc" 2>/dev/null || true
+  sudo umount "$AGENT_ROOT/dev"  2>/dev/null || true
+  sudo umount "$AGENT_ROOT/sys"  2>/dev/null || true
+}
+
+update_agent() {
+  local root="$FC_DIR/squashfs-root"
+  [ -d "$root" ] || { echo "no squashfs-root in $FC_DIR — run './update-firecracker.sh images' first" >&2; exit 1; }
+  AGENT_ROOT="$root"
+  trap agent_umount_binds EXIT
+
+  local version ext4
+  version="$(grep -oP '(?<=VERSION_ID=\")[0-9.]+' "$root/etc/os-release" 2>/dev/null || true)"
+  [ -n "$version" ] || version="24.04"
+  ext4="$FC_DIR/ubuntu-$version.ext4"
+
+  # Outbound internet: the CI fcnet-setup.sh assigns the /30 address from the
+  # MAC but installs NO default route, so the guest can only reach the host.
+  # Append a route step: gateway = the /30's host end (guest IP with the last
+  # octet decremented), matching start-vm.sh's VM_ID convention (guest .2 of
+  # each /30, host .1).
+  echo "==> agent: patching fcnet-setup.sh to add a default route (CI image ships none)"
+  if ! sudo grep -q 'set_default_route' "$root/usr/local/bin/fcnet-setup.sh"; then
+    sudo tee -a "$root/usr/local/bin/fcnet-setup.sh" >/dev/null <<'FCNET'
+
+# --- appended by update-firecracker.sh (agent step) -----------------------
+# CI image ships no default route: without one the guest can't reach DNS or
+# the internet (only the host on its /30). Gateway = the /30's host end,
+# i.e. this device's IP with the last octet decremented.
+set_default_route() {
+    devs=$(ls /sys/class/net | grep -v lo)
+    for dev in $devs; do
+        mac_ip=$(ip link show dev $dev \
+            | grep link/ether \
+            | grep -Po "(?<=06:00:)([0-9a-f]{2}:?){4}")
+        [ -n "$mac_ip" ] || continue
+        ip=$(printf "%d.%d.%d.%d" $(echo "0x${mac_ip}" | sed "s/:/ 0x/g"))
+        ip route replace default via "${ip%.*}.$((${ip##*.} - 1))" dev "$dev"
+    done
+}
+set_default_route
+FCNET
+  fi
+
+  # 1. DNS: the CI rootfs ships an EMPTY /etc/resolv.conf — nothing resolves
+  #    in the guest (apt, installers, API calls) until this is fixed.
+  echo "==> agent: writing guest /etc/resolv.conf (was empty)"
+  printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' | sudo tee "$root/etc/resolv.conf" >/dev/null
+
+  # /tmp modes: unsquashfs does not preserve the 1777 sticky bit (it extracts as
+  # 755) and /var/tmp is missing entirely — apt can't create temp files without
+  # these, and the running guest needs a proper /tmp anyway.
+  # Same story for apt's own (empty) work dirs, which the CI image pruned.
+  echo "==> agent: fixing /tmp permissions + apt work dirs (unsquashfs prunes these)"
+  sudo install -d -m 1777 "$root/tmp" "$root/var/tmp"
+  sudo install -d "$root/var/cache/apt/archives/partial" "$root/var/lib/apt/lists/partial"
+
+  # The CI rootfs is heavily pruned: no /var/log, no /var/cache, and NO dpkg
+  # status database (only lock files). apt therefore treats the image as empty
+  # and resolves the full dependency closure (~100 core packages) for the three
+  # packages we ask for, unpacking them over the existing tree. Fine for a
+  # disposable image — dpkg just needs its dirs + an empty (valid) status file.
+  echo "==> agent: creating dpkg work dirs + empty status db (CI image ships none)"
+  sudo install -d "$root/var/log" "$root/var/log/apt"
+  sudo install -d "$root/var/lib/dpkg/info" "$root/var/lib/dpkg/updates" "$root/var/lib/dpkg/triggers"
+  sudo test -f "$root/var/lib/dpkg/status" || sudo touch "$root/var/lib/dpkg/status"
+
+  # 2. chroot: host x86_64 -> guest x86_64, plain chroot works. Bind the
+  #    kernel filesystems; apt and the claude installer both expect them.
+  echo "==> agent: chroot apt-get update + install: ${AGENT_APT_PKGS[*]}"
+  agent_umount_binds
+  sudo mount --bind /proc "$root/proc"
+  sudo mount --bind /dev  "$root/dev"
+  sudo mount --bind /sys  "$root/sys"
+
+  # Run commands in the guest tree with a clean root env. env -u SUDO_*:
+  # `sudo chroot` leaks SUDO_USER et al., and the claude installer refuses to
+  # run as root when it thinks it's under sudo. HOME must be /root or the
+  # installer lands in the (host) caller's home inside the guest tree.
+  chroot_env() {
+    sudo chroot "$root" env -u SUDO_USER -u SUDO_UID -u SUDO_GID -u SUDO_COMMAND \
+      HOME=/root PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+      DEBIAN_FRONTEND=noninteractive "$@"
+  }
+
+  chroot_env apt-get update
+  chroot_env apt-get install -y --no-install-recommends "${AGENT_APT_PKGS[@]}"
+  # 3. Claude Code native installer (stable channel). It bundles its own
+  #    runtime — the guest needs no Node.js.
+  echo "==> agent: running the Claude Code native installer (stable) in the chroot"
+  chroot_env bash -c 'curl -fsSL https://claude.ai/install.sh | bash -s stable'
+  # claude's layout: ~/.local/bin/claude is a SYMLINK to
+  # /root/.local/share/claude/versions/<v>. The symlink target is a
+  # guest-absolute path, so it dangles when seen from the host tree — check the
+  # versioned dir (the real ~300 MB binary) and the symlink, not `test -x`.
+  sudo test -d "$root/root/.local/share/claude/versions" || {
+    echo "claude not installed under $root/root/.local/share/claude/versions" >&2
+    exit 1
+  }
+  sudo test -L "$root/root/.local/bin/claude" || {
+    echo "claude launcher symlink missing: $root/root/.local/bin/claude" >&2
+    exit 1
+  }
+
+  echo "==> agent: verifying the stable-channel pin + putting claude on PATH"
+  # `claude install stable` writes {"autoUpdatesChannel":"stable"} itself;
+  # only intervene if it's missing or wrong.
+  sudo mkdir -p "$root/root/.claude"
+  if ! sudo cat "$root/root/.claude/settings.json" 2>/dev/null \
+       | jq -e '.autoUpdatesChannel == "stable"' >/dev/null; then
+    local tmp; tmp="$(mktemp)"
+    if sudo cat "$root/root/.claude/settings.json" 2>/dev/null \
+         | jq '. + {autoUpdatesChannel:"stable"}' >"$tmp" 2>/dev/null && [ -s "$tmp" ]; then
+      sudo cp "$tmp" "$root/root/.claude/settings.json"
+    else
+      printf '{ "autoUpdatesChannel": "stable" }\n' | sudo tee "$root/root/.claude/settings.json" >/dev/null
+    fi
+    rm -f "$tmp"
+  fi
+  # Non-interactive ssh shells skip ~/.bashrc, so symlink claude onto the
+  # default PATH (matters for share-dir.sh and one-shot ssh commands).
+  sudo ln -sfn /root/.local/bin/claude "$root/usr/local/bin/claude"
+
+  # 4. ripgrep: static musl binary fetched by the host — deliberately NOT via
+  #    apt, so the only thing pulling packages is what has no static build
+  #    (git, mount.nfs).
+  echo "==> agent: installing ripgrep (static musl build)"
+  local rgver rgdir
+  rgver="$(curl -fsSL https://api.github.com/repos/BurntSushi/ripgrep/releases/latest | jq -r '.tag_name')"
+  rgdir="$(mktemp -d)"
+  curl -fsSL -o "$rgdir/rg.tgz" \
+    "https://github.com/BurntSushi/ripgrep/releases/download/$rgver/ripgrep-$rgver-x86_64-unknown-linux-musl.tar.gz"
+  tar -xzf "$rgdir/rg.tgz" -C "$rgdir"
+  sudo install -m 755 "$rgdir/ripgrep-$rgver-x86_64-unknown-linux-musl/rg" "$root/usr/bin/rg"
+  rm -rf "$rgdir"
+  echo "    rg $rgver -> /usr/bin/rg"
+
+  # 5. The binds MUST come off before mkfs.ext4 -d, or the host's /proc ends
+  #    up inside the image we build next.
+  agent_umount_binds
+  trap - EXIT
+
+  # 6. Rebuild the ext4, grown from 1 GiB to 2 GiB for guest-side installs.
+  #    NOTE: this discards any state in the previous ext4 (e.g. packages
+  #    installed over SSH) — by design, to keep rebuilds reproducible.
+  #    Refuse to rewrite the image under a running VM (mkfs on a live backing
+  #    file corrupts the guest).
+  if command -v fuser >/dev/null 2>&1 && fuser -s "$ext4" 2>/dev/null; then
+    echo "refusing: $ext4 is in use (a VM is running off it) — ./stop-vm.sh first" >&2
+    exit 1
+  fi
+  echo "==> agent: rebuilding $ext4 (2 GiB)"
+  rm -f "$ext4"
+  truncate -s 2G "$ext4"
+  sudo mkfs.ext4 -q -d "$root" -F "$ext4"
+  ln -sfn "ubuntu-$version.ext4" "$FC_DIR/ubuntu-latest.ext4"
+
+  echo "==> agent: done — guest image ready:"
+  ls -la "$FC_DIR/ubuntu-latest.ext4"
 }
 
 # --- subcommands ------------------------------------------------------------
@@ -162,6 +338,11 @@ update_images() {
 
   sudo chown -R root:root "$FC_DIR/squashfs-root"
   local ext4="$FC_DIR/ubuntu-$ubuntu_version.ext4"
+  # Refuse to rewrite the image under a running VM (same guard as the agent step).
+  if command -v fuser >/dev/null 2>&1 && fuser -s "$ext4" 2>/dev/null; then
+    echo "refusing: $ext4 is in use (a VM is running off it) — ./stop-vm.sh first" >&2
+    exit 1
+  fi
   rm -f "$ext4"
   truncate -s 1G "$ext4"
   sudo mkfs.ext4 -q -d "$FC_DIR/squashfs-root" -F "$ext4"
@@ -170,7 +351,6 @@ update_images() {
   # without the caller needing to know the exact version numbers.
   ln -sfn "vmlinux-$latest_kernel_ver" "$FC_DIR/vmlinux-latest"
   ln -sfn "ubuntu-$ubuntu_version.ext4" "$FC_DIR/ubuntu-latest.ext4"
-  ln -sfn "ubuntu-$ubuntu_version.id_rsa" "$FC_DIR/ubuntu-latest.id_rsa"
   # guest.id_rsa is the canonical key name; ubuntu-latest.id_rsa points at it
   # for compatibility with older start-vm.sh defaults.
   ln -sfn "guest.id_rsa" "$FC_DIR/ubuntu-latest.id_rsa"
@@ -190,9 +370,10 @@ for a in "$@"; do [ "$a" = "--force" ] && FORCE=1; done
 case "$ACTION" in
   binary)  update_binary ;;
   images)  update_images ;;
+  agent)   update_agent ;;
   all)     update_binary; update_images ;;
   *)
-    echo "usage: $0 {binary|images|all} [--force]" >&2
+    echo "usage: $0 {binary|images|agent|all} [--force]" >&2
     exit 2
     ;;
 esac
