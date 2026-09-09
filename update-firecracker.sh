@@ -5,7 +5,7 @@
 #   ./update-firecracker.sh binary     # update the firecracker binary from GitHub Releases
 #   ./update-firecracker.sh images     # update the guest kernel + Ubuntu rootfs from the CI S3 bucket
 #   ./update-firecracker.sh agent       # turn the extracted rootfs into an agent image
-#                                      # (DNS fix, git/rg/nfs-common, Claude Code, 2 GiB ext4)
+#                                      # (DNS fix, nfs-common/rg, Claude Code, 2 GiB ext4)
 #   ./update-firecracker.sh all        # binary + images (default)
 #   ./update-firecracker.sh images --force   # rebuild the rootfs even if versions match
 #
@@ -86,10 +86,11 @@ ensure_guest_key() {
 
 # --- agent subcommand ---------------------------------------------------------
 # Turns squashfs-root/ (from the `images` step) into an image ready for agent
-# sessions: working DNS, git + nfs-common via apt, a static ripgrep binary, the
+# sessions: working DNS, nfs-common via apt, a static ripgrep binary, the
 # stable Claude Code binary, and a 2 GiB rootfs so guest-side installs have
-# headroom.
-AGENT_APT_PKGS=(git nfs-common)
+# headroom. Deliberately NO git in the guest — this limits Claude Code's
+# rewind capability inside the microVM (documented in the README).
+AGENT_APT_PKGS=(nfs-common)
 AGENT_ROOT=""  # global: the EXIT trap below must not reference locals
 
 agent_umount_binds() {
@@ -155,7 +156,7 @@ FCNET
 
   # The CI rootfs is heavily pruned: no /var/log, no /var/cache, and NO dpkg
   # status database (only lock files). apt therefore treats the image as empty
-  # and resolves the full dependency closure (~100 core packages) for the three
+  # and resolves the full dependency closure (~100 core packages) for the few
   # packages we ask for, unpacking them over the existing tree. Fine for a
   # disposable image — dpkg just needs its dirs + an empty (valid) status file.
   echo "==> agent: creating dpkg work dirs + empty status db (CI image ships none)"
@@ -184,12 +185,6 @@ FCNET
   chroot_env apt-get update
   chroot_env apt-get install -y --no-install-recommends "${AGENT_APT_PKGS[@]}"
 
-  # share-dir.sh exports with root_squash+anonuid, so NFS-shared worktrees are
-  # owned by the host user's uid, not root — git in the guest would refuse them
-  # ("detected dubious ownership"). This VM is a disposable single-user sandbox;
-  # trust every repo.
-  echo "==> agent: git config — trust shared worktrees (safe.directory '*')"
-  chroot_env git config --global --add safe.directory '*'
   # 3. Claude Code native installer (stable channel). It bundles its own
   #    runtime — the guest needs no Node.js.
   echo "==> agent: running the Claude Code native installer (stable) in the chroot"
@@ -227,8 +222,7 @@ FCNET
   sudo ln -sfn /root/.local/bin/claude "$root/usr/local/bin/claude"
 
   # 4. ripgrep: static musl binary fetched by the host — deliberately NOT via
-  #    apt, so the only thing pulling packages is what has no static build
-  #    (git, mount.nfs).
+  #    apt, so the only thing pulling packages is mount.nfs (no static build).
   echo "==> agent: installing ripgrep (static musl build)"
   local rgver rgdir
   rgver="$(curl -fsSL https://api.github.com/repos/BurntSushi/ripgrep/releases/latest | jq -r '.tag_name')"
