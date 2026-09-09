@@ -48,7 +48,55 @@ If `/dev/net/tun` is missing:
 sudo modprobe tun
 ```
 
-## Setup
+## Quick start on a new host
+
+Everything needed to go from a bare Linux box to Claude Code running inside a firecracker VM, in order:
+
+```bash
+# 1. requirements (checked in detail below): x86_64 + KVM, TUN, nftables,
+#    nfs-utils, standard tools, sudo. On Fedora the gaps are usually:
+#    sudo dnf install squashfs-tools e2fsprogs nftables jq wget nfs-utils
+
+# 2. clone + verify the host
+git clone git@github.com:pshickeydev/firecracker-scripts.git
+cd firecracker-scripts
+./prereqs.sh
+
+# 3. fetch the firecracker binary + guest kernel/rootfs, then build the agent image
+./update-firecracker.sh            # binary + images (~10 min, needs sudo)
+./update-firecracker.sh agent      # DNS fix, git/nfs-common/rg, Claude Code, 2 GiB (~10 min)
+
+# 4. mint credentials (browser OAuth; installs `ant` via go if missing)
+./auth-login.sh
+
+# 5. per session — boot with your workspace live-mounted, share credentials, run
+SHARE_DIR=~/some/project ./start-vm.sh 0
+./share-dir.sh 0 "$PWD/anthropic-config" /root/.config/anthropic
+ssh -t -i guest.id_rsa root@172.16.0.2
+     # then: cd /workspace && ANTHROPIC_PROFILE=fc-agents claude
+```
+
+### What it installs on the host
+
+The scripts keep everything they build (images, keys, logs, credentials) inside the repo dir — gitignored. But some host-level state is created; worth knowing before adopting:
+
+| Persistent (survives reboots) | Per-boot (created + torn down by the scripts) |
+|---|---|
+| `/usr/local/bin/firecracker-<tag>` + `firecracker` symlink | TAP device `fc<N>` + its `/30` address |
+| `/etc/sysctl.d/99-fc-agents.conf` (`ip_forward=1`) | nft `fc-nat` table (NAT + forward rules) |
+| `/etc/exports.d/fc-agents.exports` (one entry per shared dir; `--unmount` removes) | firewalld: TAP bound to the uplink's zone + NFS rich rule |
+| `nfs-server` service enabled | |
+| `~/go/bin/ant` (only if `go` is present) | |
+
+### Second-machine caveats
+
+- **`anthropic-config/` does not travel with the repo** (gitignored — it holds live refresh tokens). On another machine, run `./auth-login.sh` there. The same account can hold the profile refreshed from multiple hosts, but never keep **two copies of the same profile mounted at the same time** — refresh-token rotation would orphan one of them (the rotation hazard, below).
+- The `172.16.0.0/24` range must not collide with an existing route on the host; if it does, edit the derivation in `start-vm.sh` (and `NFS_SUBNET` in `share-dir.sh`).
+- Guest DNS is baked as `1.1.1.1`/`8.8.8.8` — fine unless the network blocks external resolvers.
+- The firewalld and SELinux paths auto-detect; on hosts without them (e.g. Debian-family with ufw, no SELinux) the guards simply skip.
+- The CI kernel/rootfs are **x86_64-only**.
+
+## Setup (detailed, per-command reference)
 
 ```bash
 # 1. get the scripts
