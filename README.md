@@ -64,7 +64,9 @@ cd firecracker-scripts
 
 # 3. fetch the firecracker binary + guest kernel/rootfs, then build the agent image
 ./update-firecracker.sh            # binary + images (~10 min, needs sudo)
-./update-firecracker.sh agent      # DNS fix, nfs-common/rg, Claude Code, 2 GiB (~10 min)
+./update-firecracker.sh agent      # DNS fix, nfs-common/rg, Claude Code, 2 GiB,
+                                   # apt state stripped — no package manager in
+                                   # the running guest (~10 min)
 
 # 4. mint credentials (browser OAuth; installs `ant` via go if missing)
 ./auth-login.sh
@@ -130,8 +132,10 @@ Two constraints shape the design:
 # 1. build the agent image: fixes guest DNS (empty resolv.conf in the CI rootfs),
 #    installs nfs-common via apt, drops in a static ripgrep binary, installs
 #    the stable Claude Code binary (it bundles its own runtime — no Node in the
-#    guest), pins the stable auto-update channel, and grows the ext4 to 2 GiB.
-#    No git is installed in the guest — see the caveat below.
+#    guest), pins the stable auto-update channel, grows the ext4 to 2 GiB, and
+#    then strips the apt/dpkg state so the running image — like the upstream
+#    CI rootfs — has no working package manager. No git either — see the caveats
+#    below.
 ./update-firecracker.sh agent
 
 # 2. mint credentials (opens a browser for the Anthropic OAuth flow)
@@ -181,7 +185,9 @@ If you have files created during earlier `no_root_squash` sessions, fix them onc
 
 Caveat: inotify doesn't cross NFS — irrelevant for Claude Code (it inspects files via bash commands), but don't expect host-side file-watchers to see guest-side writes.
 
-**No git in the guest, so Claude Code's rewind is limited inside the microVM.** The agent image deliberately ships without git (smaller image, less to install; the guest is a disposable sandbox). The cost: Claude Code's rewind / checkpoint capability relies on git to snapshot and restore file state, so without it you can't reliably rewind to a previous point in a session — treat edits as one-way inside the VM (or undo them by asking Claude to revert the specific changes). It also means git commands simply don't work in the guest (`status`/`commit`/`log` against the shared workspace fail) — do repo operations on the host. If a workflow needs them, `apt install git` over SSH — the guest ext4 is persistent across reboots, so the install survives until the next `images`/`agent` rebuild. The shared NFS worktree is owned by your host uid (not root), so also re-add the trust the image no longer bakes in: `git config --global --add safe.directory '*'`.
+**No git in the guest, so Claude Code's rewind is limited inside the microVM.** The agent image deliberately ships without git (smaller image, less to install; the guest is a disposable sandbox). The cost: Claude Code's rewind / checkpoint capability relies on git to snapshot and restore file state, so without it you can't reliably rewind to a previous point in a session — treat edits as one-way inside the VM (or undo them by asking Claude to revert the specific changes). It also means git commands simply don't work in the guest (`status`/`commit`/`log` against the shared workspace fail) — do repo operations on the host.
+
+**No working package manager in the guest — package installation is build-time only.** The `agent` step installs its packages (nfs-common, etc.) inside the chroot on the host, then strips everything that makes apt functional — `/etc/apt` (sources + keyrings), the apt lists, the dpkg database, apt/dpkg logs and caches — before building the ext4. Like the upstream Firecracker CI rootfs (whose build drops all of `/var` from the shipped tree and empties resolv.conf, leaving apt as inert binaries), the running guest can neither locate nor fetch any package: `apt-get install` fails with *Unable to locate package*, and `apt-get update` has no sources to fetch. To ship git (or anything else) in the guest, add it to `AGENT_APT_PKGS` in `update-firecracker.sh` and re-run `./update-firecracker.sh agent` — there is deliberately no way to install packages at runtime.
 
 ## Run a VM
 
@@ -296,7 +302,7 @@ After `./update-firecracker.sh` (plus `agent`), the repo directory also contains
 
 ```
 vmlinux-<version>          # guest kernel
-ubuntu-<version>.ext4      # guest rootfs (agent step: 2 GiB, claude, rg, nfs-common)
+ubuntu-<version>.ext4      # guest rootfs (agent step: 2 GiB, claude, rg, nfs-common, apt state stripped)
 ubuntu-<version>.squashfs.upstream
 squashfs-root/             # extracted rootfs tree the ext4 is built from
 guest.id_rsa / .pub        # dedicated SSH keypair (gitignored)
@@ -313,6 +319,6 @@ fc-vm*.log                 # per-VM serial console logs
 - Firecracker's serial console goes to `fc-vm<ID>.log` — `tail -f` it to watch boot. For interactive access, use SSH (the scripts launch firecracker detached with stdin from `/dev/null`, so the serial console is read-only by design).
 - Networking uses a hardcoded `172.16.0.0/24` range. Each VM's `/30` subnet and TAP name are derived from `VM_ID` inside `start-vm.sh` (`GUEST_IP`, `HOST_IP`, `TAP`, and the MAC are computed, not env-overridable). If the `172.16.0.0/24` range collides with another network on your host, edit the derivation in `start-vm.sh` (and `NFS_SUBNET` in `share-dir.sh`).
 - Guest internet egress needs four things, all handled by `start-vm.sh` (each was a real failure mode on Fedora): the host routes (`net.ipv4.ip_forward=1`, persisted to `/etc/sysctl.d/99-fc-agents.conf`), masquerade by **source subnet** leaving via the uplink (nft), the TAP bound to the **same firewalld zone as the uplink interface** + intra-zone forwarding (`--add-forward`) — firewalld rejects cross-zone forwarding even when our own nft chains accept — and a **default route in the guest** (the CI `fcnet-setup.sh` ships none; the `agent` step patches it in).
-- `./update-firecracker.sh agent` operates on the extracted `squashfs-root/` tree and rebuilds the ext4 from it — any state accumulated in the previous ext4 (packages installed over SSH, etc.) is discarded by design, keeping rebuilds reproducible. Re-run `agent` after every `images` rebuild. The flip side: `agent` never removes anything the previous run put into `squashfs-root/` — converting a tree built by an older script version (e.g. one with git) requires `./update-firecracker.sh images --force` (fresh extract; plain `images` skips if versions match) followed by `agent`.
-- The guest ext4 is persistent: anything installed over SSH survives guest reboots, but not an `images`/`agent` rebuild.
+- `./update-firecracker.sh agent` operates on the extracted `squashfs-root/` tree and rebuilds the ext4 from it — any state accumulated in the previous ext4 (e.g. a newer claude pulled by the auto-updater) is discarded by design, keeping rebuilds reproducible. The apt/dpkg state stripped from the shipped image lives on in `squashfs-root/` (the strip runs on a hardlink staging copy), so re-running `agent` stays a fast idempotent no-op for the apt part. Re-run `agent` after every `images` rebuild. The flip side still holds: `agent` never removes anything the previous run put into `squashfs-root/` — converting a tree built by an older script version (e.g. one with git) requires `./update-firecracker.sh images --force` (fresh extract; plain `images` skips if versions match) followed by `agent`.
+- The guest ext4 is persistent across guest reboots (e.g. claude's self-updates survive), but not an `images`/`agent` rebuild. It ships no working package manager: the image is built appliance-style — packages are installed in the build chroot only, via `AGENT_APT_PKGS` in `update-firecracker.sh`.
 - The CI rootfs ships an empty `/etc/resolv.conf`; the `agent` step bakes working nameservers (`1.1.1.1`, `8.8.8.8`) into the image. Without it nothing resolves in the guest.

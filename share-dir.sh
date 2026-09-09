@@ -218,8 +218,9 @@ host_export
 # --- guest mount --------------------------------------------------------------
 
 if ! guest "test -x /sbin/mount.nfs -o -x /usr/sbin/mount.nfs"; then
-  echo "guest has no mount.nfs — run './update-firecracker.sh agent' to rebuild" >&2
-  echo "the image with nfs-common, or install it in the guest: apt-get install -y nfs-common" >&2
+  echo "guest has no mount.nfs — the image predates the nfs-common install or wasn't" >&2
+  echo "built by the agent step. Rebuild it: ./update-firecracker.sh agent (the guest" >&2
+  echo "ships no working package manager, so it can't be installed at runtime)" >&2
   exit 1
 fi
 

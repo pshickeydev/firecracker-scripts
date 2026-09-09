@@ -9,6 +9,8 @@ ubuntu-*.squashfs.upstream
 ubuntu-*.id_rsa
 ubuntu-*.id_rsa.pub
 squashfs-root/
+# transient hardlink staging copy the agent step builds the ext4 from
+.agent-stage*
 
 # Symlinks to the "latest" assets — created by update-firecracker.sh, but keep
 # the symlink names themselves out of the repo too since their targets are
@@ -42,4 +44,3 @@ release-v*/
 *.swp
 *.swo
 *~
-fc-vm*.log}

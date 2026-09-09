@@ -5,7 +5,9 @@
 #   ./update-firecracker.sh binary     # update the firecracker binary from GitHub Releases
 #   ./update-firecracker.sh images     # update the guest kernel + Ubuntu rootfs from the CI S3 bucket
 #   ./update-firecracker.sh agent       # turn the extracted rootfs into an agent image
-#                                      # (DNS fix, nfs-common/rg, Claude Code, 2 GiB ext4)
+#                                      # (DNS fix, nfs-common/rg, Claude Code, 2 GiB ext4,
+#                                      #  apt state stripped — no working package manager
+#                                      #  in the running guest)
 #   ./update-firecracker.sh all        # binary + images (default)
 #   ./update-firecracker.sh images --force   # rebuild the rootfs even if versions match
 #
@@ -87,11 +89,17 @@ ensure_guest_key() {
 # --- agent subcommand ---------------------------------------------------------
 # Turns squashfs-root/ (from the `images` step) into an image ready for agent
 # sessions: working DNS, nfs-common via apt, a static ripgrep binary, the
-# stable Claude Code binary, and a 2 GiB rootfs so guest-side installs have
-# headroom. Deliberately NO git in the guest — this limits Claude Code's
-# rewind capability inside the microVM (documented in the README).
+# stable Claude Code binary, and a 2 GiB rootfs so Claude Code's versioned
+# self-updates have headroom. Deliberately NO git in the guest — this limits
+# Claude Code's rewind capability inside the microVM (documented in the README).
+#
+# Package installation is build-time ONLY: after installing, all apt/dpkg state
+# is stripped from the shipped image (upstream-style appliance — see the strip
+# step below), so the running guest has no working package manager. To add a
+# package, put it in AGENT_APT_PKGS and re-run this step.
 AGENT_APT_PKGS=(nfs-common)
-AGENT_ROOT=""  # global: the EXIT trap below must not reference locals
+AGENT_ROOT=""    # global: the EXIT trap below must not reference locals
+AGENT_STAGE=""   # global: staged hardlink copy the ext4 is built from
 
 agent_umount_binds() {
   # Drop any /proc /dev /sys bind-mounts left in the guest tree (a previous
@@ -102,11 +110,16 @@ agent_umount_binds() {
   sudo umount "$AGENT_ROOT/sys"  2>/dev/null || true
 }
 
+agent_cleanup() {
+  agent_umount_binds
+  [ -n "$AGENT_STAGE" ] && sudo rm -rf "$AGENT_STAGE" 2>/dev/null || true
+}
+
 update_agent() {
   local root="$FC_DIR/squashfs-root"
   [ -d "$root" ] || { echo "no squashfs-root in $FC_DIR — run './update-firecracker.sh images' first" >&2; exit 1; }
   AGENT_ROOT="$root"
-  trap agent_umount_binds EXIT
+  trap agent_cleanup EXIT
 
   local version ext4
   version="$(grep -oP '(?<=VERSION_ID=\")[0-9.]+' "$root/etc/os-release" 2>/dev/null || true)"
@@ -237,11 +250,59 @@ FCNET
   # 5. The binds MUST come off before mkfs.ext4 -d, or the host's /proc ends
   #    up inside the image we build next.
   agent_umount_binds
-  trap - EXIT
 
-  # 6. Rebuild the ext4, grown from 1 GiB to 2 GiB for guest-side installs.
-  #    NOTE: this discards any state in the previous ext4 (e.g. packages
-  #    installed over SSH) — by design, to keep rebuilds reproducible.
+  # 6. Strip the package-manager state so the shipped image — like the
+  #    upstream CI rootfs — has NO working apt. The chroot install above
+  #    necessarily populates apt/dpkg state in the tree: ~51 MB of apt
+  #    lists, a dpkg status database, and apt/dpkg logs and caches.
+  #    Upstream's build (tools/functions in firecracker) sidesteps this by
+  #    copying only bin/etc/home/lib/root/sbin/usr into the shipped tree
+  #    (all of /var is dropped) and emptying resolv.conf, so its guests
+  #    ship apt as inert binaries. We must keep DNS (Claude Code needs the
+  #    API + the stable-channel auto-updater), so DNS alone can't be the
+  #    kill switch: we remove everything that makes apt *functional* —
+  #    /etc/apt (sources + keyrings: `apt-get update` fetches nothing,
+  #    `apt-get install` can't locate any package), the apt lists, the
+  #    dpkg database, and apt/dpkg logs and caches.
+  #    The strip runs on a hardlink staging copy, NOT on squashfs-root:
+  #    the build tree keeps its dpkg status so re-runs of this step are
+  #    fast idempotent no-ops, while the shipped image stays stateless.
+  echo "==> agent: stripping apt/dpkg state from the image (no package manager in the guest)"
+  # Sweep staging dirs leaked by runs that died hard (kill -9 / power loss:
+  # the EXIT trap only covers failures the shell can catch). PIDs encoded in
+  # the names let a live concurrent run's stage survive.
+  local stale
+  for stale in "$FC_DIR"/.agent-stage.*; do
+    [ -e "$stale" ] || continue   # glob didn't match — nothing to sweep
+    kill -0 "${stale##*.}" 2>/dev/null || sudo rm -rf "$stale"
+  done
+  AGENT_STAGE="$FC_DIR/.agent-stage.$$"
+  sudo rm -rf "$AGENT_STAGE"
+  sudo cp -al "$root" "$AGENT_STAGE"
+  sudo rm -rf "$AGENT_STAGE/etc/apt" \
+              "$AGENT_STAGE/var/lib/apt" \
+              "$AGENT_STAGE/var/cache" \
+              "$AGENT_STAGE/var/log" \
+              "$AGENT_STAGE/var/lib/ucf" \
+              "$AGENT_STAGE/var/lib/python"
+  # dpkg: empty the database dir entirely (upstream ships it empty; the
+  # lock files are dpkg's own artifacts, not needed by anything at runtime).
+  [ -d "$AGENT_STAGE/var/lib/dpkg" ] \
+    && sudo find "$AGENT_STAGE/var/lib/dpkg" -mindepth 1 -delete || true
+  # sanity: refuse to ship an image that could still resolve or fetch packages
+  sudo test ! -e "$AGENT_STAGE/etc/apt/sources.list" || {
+    echo "strip failed: /etc/apt/sources.list still present" >&2; exit 1; }
+  sudo test ! -e "$AGENT_STAGE/var/lib/dpkg/status" || {
+    echo "strip failed: /var/lib/dpkg/status still present" >&2; exit 1; }
+  sudo test ! -e "$AGENT_STAGE/var/lib/apt/lists" || {
+    echo "strip failed: apt lists still present" >&2; exit 1; }
+
+  # 7. Rebuild the ext4, grown from 1 GiB to 2 GiB — headroom for Claude
+  #    Code's versioned self-updates (each downloaded release is ~300 MB),
+  #    not for package installs: the guest ships no working package manager.
+  #    NOTE: this discards any state in the previous ext4 (e.g. a newer
+  #    claude downloaded by the auto-updater) — by design, to keep rebuilds
+  #    reproducible.
   #    Refuse to rewrite the image under a running VM (mkfs on a live backing
   #    file corrupts the guest).
   if command -v fuser >/dev/null 2>&1 && fuser -s "$ext4" 2>/dev/null; then
@@ -251,9 +312,11 @@ FCNET
   echo "==> agent: rebuilding $ext4 (2 GiB)"
   rm -f "$ext4"
   truncate -s 2G "$ext4"
-  sudo mkfs.ext4 -q -d "$root" -F "$ext4"
+  sudo mkfs.ext4 -q -d "$AGENT_STAGE" -F "$ext4"
+  sudo rm -rf "$AGENT_STAGE"; AGENT_STAGE=""
   ln -sfn "ubuntu-$version.ext4" "$FC_DIR/ubuntu-latest.ext4"
 
+  trap - EXIT
   echo "==> agent: done — guest image ready:"
   ls -la "$FC_DIR/ubuntu-latest.ext4"
 }
