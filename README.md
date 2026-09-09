@@ -10,7 +10,7 @@ Seven small scripts, no runtime dependencies beyond standard Linux tools:
 | `update-firecracker.sh` | Fetches/updates the `firecracker` binary and the guest kernel + Ubuntu rootfs. |
 | `start-vm.sh` | Boots a networked microVM, prints the `ssh` command. Supports multiple concurrent VMs. |
 | `list-vms.sh` | Shows running VMs: guest IP, TAP device, PID, config, and liveness. |
-| `stop-vm.sh` | Cleanly shuts a VM down and tears down its host networking. |
+| `stop-vm.sh` | Cleanly shuts a VM down (orderly poweroff over SSH) and tears down its host networking. |
 | `share-dir.sh` | Shares a host directory into a running VM, live, over NFSv4 (with `--unmount`). |
 | `auth-login.sh` | Mints Anthropic platform credentials on the host for in-VM Claude Code (via `ant`). |
 
@@ -196,6 +196,42 @@ ssh -i guest.id_rsa root@172.16.0.2
 ./stop-vm.sh
 ```
 
+### Clean shutdown
+
+`stop-vm.sh` runs `systemctl poweroff` over SSH, waits for the guest to actually
+halt, then reaps the firecracker process and tears down host networking — so ext4
+unmounts properly instead of replaying the journal on next boot.
+
+Two non-obvious facts drive the design:
+
+- **No ctrl-alt-del.** The API's `SendCtrlAltDel` is inert here: `start-vm.sh`
+  boot args pass `i8042.noaux i8042.nomux i8042.nopnp i8042.dumbkbd`, the
+  controller probe fails (`error -22`), so the injected scancode reaches no
+  driver (the call still returns `204`). It is intentionally not used.
+- **A clean poweroff does NOT exit firecracker.** x86 Firecracker has no power
+  device, so the kernel prints `reboot: Power off not available: System halted
+  instead` and parks the VCPUs while the parent process keeps running. "Process
+  exited" is therefore *not* the halt signal; `stop-vm.sh` always reaps.
+
+Halt is confirmed by two independent signals, checked each poll:
+
+1. **Serial log (authoritative).** The boot log ends with that final `reboot:`
+   line — proof `poweroff.target` completed and filesystems were unmounted. The
+   log is `rm -f`'d every boot, so a match can't be stale.
+2. **Fallback:** guest answers no ping (a live-but-idle VM always answers ICMP;
+   parked VCPUs kill virtio-net RX) *and* its CPU time stays frozen across two
+   consecutive polls. Ping is the gate that stops an idle live guest from being
+   misread as halted.
+
+Consequences:
+
+- `ssh` must be present on the host, or you silently fall back to hard kills.
+- Every outcome prints how it was decided (`serial log confirms…` vs
+  `guest unreachable + CPU frozen…`); a path that ends in a kill without halt
+  evidence says so on stderr. Read that line rather than assuming a clean stop.
+- Typical clean stop is ~12s (matches the image's systemd teardown); the wait
+  budget is 45s to absorb slow NFS unmounts from shared workspaces.
+
 ### Multiple concurrent VMs
 
 Each VM id gets its own API socket, TAP device, and /30 subnet:
@@ -226,6 +262,7 @@ VM_ID=3 FC_DIR=/some/other/dir ./start-vm.sh   # VM_ID env wins over the positio
 KERNEL=/path/to/vmlinux ROOTFS=/path/to/rootfs.ext4 SSH_KEY=/path/to/key ./start-vm.sh
 SHARE_DIR=~/project ./start-vm.sh          # live-mount ~/project at /workspace in the guest
 SHARE_DIR=~/project SHARE_MNT=/work ./start-vm.sh  # ...or at a custom guest path
+VCPU_COUNT=4 MEM_SIZE_MIB=8192 ./start-vm.sh   # override the machine profile (default: 2 vCPU / 2048 MiB)
 AGENT_PROFILE=fc-agents ./auth-login.sh    # auth profile name (default fc-agents)
 ANTHROPIC_CONFIG_DIR=... ./auth-login.sh   # ant's config dir (default <repo>/anthropic-config)
 ```
@@ -235,6 +272,7 @@ Notes:
 - `start-vm.sh`, `stop-vm.sh`, and `list-vms.sh` all understand `FC_SOCKET_DIR` and `VM_ID` — pass the same values you started the VM with when stopping or listing it.
 - A fully-renamed `API_SOCKET` is only seen by `./list-vms.sh <id>` (single-id mode), not by the socket scan.
 - `VM_ID` must be an integer in `0..63` — each id consumes one /30 out of the `172.16.0.0/24` range.
+- `VCPU_COUNT` (>= 1) and `MEM_SIZE_MIB` (>= 128) are validated and rejected if not integers; Firecracker has no memory or vCPU hot-plug, so a running VM keeps the profile it booted with (`./list-vms.sh` shows it).
 
 ## Layout
 

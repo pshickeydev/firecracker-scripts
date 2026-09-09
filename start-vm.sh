@@ -11,6 +11,10 @@
 # Combined with ./share-dir.sh <id> <dir> /root/.config/anthropic and
 # ANTHROPIC_PROFILE, this gives a live host workspace + auth for in-VM agents.
 #
+# Machine profile: VCPU_COUNT (default 2) and MEM_SIZE_MIB (default 2048) set
+# the guest's vCPU and memory. Applied at boot only — change them by restarting
+# the VM, not while it runs.
+#
 # Layout (all under this repo's dir unless overridden via env):
 #   vmlinux-latest     -> guest kernel (symlink, managed by update-firecracker.sh)
 #   ubuntu-latest.ext4 -> guest rootfs (symlink)
@@ -39,6 +43,20 @@ LOG_FILE="${FC_DIR}/fc-vm${VM_ID}.log"
 KERNEL="${KERNEL:-$FC_DIR/vmlinux-latest}"
 ROOTFS="${ROOTFS:-$FC_DIR/ubuntu-latest.ext4}"
 SSH_KEY="${SSH_KEY:-$FC_DIR/guest.id_rsa}"
+
+# Machine profile. Firecracker requires vcpu_count >= 1 and mem_size_mib to be
+# a whole number of MiB; hot-plugging is not supported, so these are fixed at
+# boot. Defaults are sized for an in-guest Claude Code session (512 MiB thrashed).
+VCPU_COUNT="${VCPU_COUNT:-2}"
+MEM_SIZE_MIB="${MEM_SIZE_MIB:-2048}"
+if ! [[ "$VCPU_COUNT" =~ ^[0-9]+$ ]] || (( VCPU_COUNT < 1 )); then
+  echo "VCPU_COUNT must be an integer >= 1 (got: '$VCPU_COUNT')" >&2
+  exit 1
+fi
+if ! [[ "$MEM_SIZE_MIB" =~ ^[0-9]+$ ]] || (( MEM_SIZE_MIB < 128 )); then
+  echo "MEM_SIZE_MIB must be an integer >= 128 (got: '$MEM_SIZE_MIB')" >&2
+  exit 1
+fi
 
 # Derive networking from VM_ID
 GUEST_LAST=$(( 2 + VM_ID * 4 ))
@@ -166,7 +184,8 @@ api /boot-source "$(jq -cn --arg k "$KERNEL" --arg a "$BOOT_ARGS" \
   '{kernel_image_path:$k, boot_args:$a}')"
 api /drives/root "$(jq -cn --arg p "$ROOTFS" \
   '{drive_id:"root", path_on_host:$p, is_root_device:true, is_read_only:false}')"
-api /machine-config '{"vcpu_count":1, "mem_size_mib":512}'
+api /machine-config "$(jq -cn --argjson v "$VCPU_COUNT" --argjson m "$MEM_SIZE_MIB" \
+  '{vcpu_count:$v, mem_size_mib:$m}')"
 # Network interface — MAC drives the guest's auto-IP via fcnet-setup.sh.
 api /network-interfaces/eth0 "$(jq -cn --arg t "$TAP" --arg m "$MAC" \
   '{iface_id:"eth0", host_dev_name:$t, guest_mac:$m}')"
