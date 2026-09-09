@@ -183,6 +183,13 @@ FCNET
 
   chroot_env apt-get update
   chroot_env apt-get install -y --no-install-recommends "${AGENT_APT_PKGS[@]}"
+
+  # share-dir.sh exports with root_squash+anonuid, so NFS-shared worktrees are
+  # owned by the host user's uid, not root — git in the guest would refuse them
+  # ("detected dubious ownership"). This VM is a disposable single-user sandbox;
+  # trust every repo.
+  echo "==> agent: git config — trust shared worktrees (safe.directory '*')"
+  chroot_env git config --global --add safe.directory '*'
   # 3. Claude Code native installer (stable channel). It bundles its own
   #    runtime — the guest needs no Node.js.
   echo "==> agent: running the Claude Code native installer (stable) in the chroot"

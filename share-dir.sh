@@ -10,11 +10,16 @@
 # NFSv4 client built in and only needs the mount.nfs helper (installed by
 # `update-firecracker.sh agent`).
 #
-# Host side:  adds "<hostdir> 172.16.0.0/24(rw,no_subtree_check,no_root_squash,fsid=N)"
-#            to /etc/exports.d/fc-agents.exports, re-exports, and (if firewalld is
-#            active) allows NFS (2049/tcp) from the VM subnet. no_root_squash is
-#            required: the guest is root-only, so guest root must act as host
-#            root on the export (single-user dev host assumption).
+# Host side:  adds "<hostdir> 172.16.0.0/24(rw,no_subtree_check,root_squash,anonuid=<you>,anongid=<you>,fsid=N)"
+#            to /etc/exports.d/fc-agents.exports, re-exports, and (if firewalld
+#            is active) allows NFS (2049/tcp) from the VM subnet.
+#            root_squash + anonuid/anongid: the guest is root-only, but guest
+#            root does NOT become host root on the export — it acts as YOUR
+#            host uid/gid. You get full read/write to your own files, and every
+#            file created during a session (workspace edits, .claude/ project
+#            dirs, token refreshes in anthropic-config) is owned by you on
+#            the host — no sudo needed to clean up, and a smaller blast
+#            radius than no_root_squash.
 # Guest side: over the existing SSH path: mkdir + mount -t nfs4 172.16.0.x:<hostdir>.
 #
 # NFS is stateless, so stop-vm.sh needs no changes; use --unmount to retire an
@@ -29,6 +34,10 @@ SSH_KEY="${SSH_KEY:-$FC_DIR/guest.id_rsa}"
 EXPORTS_FILE="/etc/exports.d/fc-agents.exports"
 NFS_SUBNET="172.16.0.0/24"
 FW_RULE='rule family=ipv4 source address=172.16.0.0/24 port port=2049 protocol=tcp accept'
+# Guest root acts as the invoking host user on the export (see header comment).
+EXPORT_UID="$(id -u)"
+EXPORT_GID="$(id -g)"
+EXPORT_OPTS="rw,no_subtree_check,root_squash,anonuid=$EXPORT_UID,anongid=$EXPORT_GID"
 
 need() { command -v "$1" >/dev/null 2>&1 || { echo "missing required tool: $1" >&2; exit 1; }; }
 need ssh; need sudo
@@ -93,6 +102,24 @@ fw_zone() { # zone the TAP is bound to (start-vm.sh binds it to the uplink's
   sudo firewall-cmd --get-default-zone 2>/dev/null || echo public
 }
 
+prune_stale_exports() { # drop entries whose host directory no longer exists
+  # (keeps exportfs -ra from choking on dirs deleted between sessions)
+  [ -f "$EXPORTS_FILE" ] && [ -r "$EXPORTS_FILE" ] || return 0
+  local tmp; tmp="$(mktemp)"
+  while read -r d rest; do
+    [ -n "$d" ] || continue
+    if [ ! -d "$d" ]; then
+      echo "==> host: pruning stale export: $d (directory no longer exists)"
+      continue
+    fi
+    printf '%s %s\n' "$d" "$rest"
+  done < "$EXPORTS_FILE" > "$tmp"
+  if ! cmp -s "$EXPORTS_FILE" "$tmp" 2>/dev/null; then
+    sudo install -m 644 -o root -g root "$tmp" "$EXPORTS_FILE"
+  fi
+  rm -f "$tmp"
+}
+
 host_export() {
   if ! command -v exportfs >/dev/null 2>&1; then
     echo "missing exportfs — install nfs-utils first (sudo dnf install nfs-utils)" >&2
@@ -100,9 +127,25 @@ host_export() {
   fi
   echo "==> host: exporting $DIR to $NFS_SUBNET ($EXPORTS_FILE)"
   sudo mkdir -p /etc/exports.d
-  if ! exported_line_exists; then
-    printf '%s %s(rw,no_subtree_check,no_root_squash,fsid=%s)\n' \
-      "$DIR" "$NFS_SUBNET" "$(next_fsid)" | sudo tee -a "$EXPORTS_FILE" >/dev/null
+  prune_stale_exports
+  # desired line, WITHOUT the fsid (that's per-entry, see below)
+  local want_prefix="${DIR} ${NFS_SUBNET}(${EXPORT_OPTS},fsid="
+  local existing
+  existing="$(sudo awk -v d="$DIR" '$1==d {print; found=1} END{exit !found}' "$EXPORTS_FILE" 2>/dev/null || true)"
+  if [ -z "$existing" ]; then
+    printf '%s%s)\n' "$want_prefix" "$(next_fsid)" | sudo tee -a "$EXPORTS_FILE" >/dev/null
+  elif [[ "$existing" != "$want_prefix"* ]]; then
+    # Entry exists with different options (e.g. legacy no_root_squash written
+    # by an older share-dir.sh). Rewrite in place, keeping its fsid.
+    echo "==> host: updating export options for $DIR -> $EXPORT_OPTS"
+    local fsid tmp
+    fsid="$(printf '%s\n' "$existing" | grep -oP 'fsid=\K[0-9]+' || true)"
+    [ -n "$fsid" ] || fsid="$(next_fsid)"
+    tmp="$(mktemp)"
+    sudo awk -v d="$DIR" -v r="${want_prefix}${fsid})" '{print ($1==d) ? r : $0}' \
+      "$EXPORTS_FILE" >"$tmp"
+    sudo install -m 644 -o root -g root "$tmp" "$EXPORTS_FILE"
+    rm -f "$tmp"
   fi
   # nfs-server must be up for exportfs to program the kernel's export table.
   systemctl is-active --quiet nfs-server 2>/dev/null || sudo systemctl enable --now nfs-server
@@ -187,9 +230,9 @@ else
   guest "mkdir -p '$MNT' && mount -t nfs4 '$HOST_IP:$DIR' '$MNT'"
 fi
 
-# Verify read-write (also proves no_root_squash works for guest root).
+# Verify read-write (also proves the anonuid mapping works for guest root).
 guest "touch '$MNT/.fc-share-test' && rm -f '$MNT/.fc-share-test'" || {
-  echo "mount succeeded but the write test failed — check no_root_squash on the export" >&2
+  echo "mount succeeded but the write test failed — check root_squash/anonuid on the export" >&2
   exit 1
 }
 

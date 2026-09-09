@@ -124,7 +124,9 @@ Why this works:
 ./share-dir.sh --unmount <VM_ID> <hostdir> [guest_mntpoint]
 ```
 
-Host side it manages `/etc/exports.d/fc-agents.exports` (`rw,no_subtree_check,no_root_squash` — required since the guest is root-only), re-exports with `exportfs -ra`, ensures `nfs-server` is running, and — if firewalld is active — allows NFS (2049/tcp) from `172.16.0.0/24`. On Fedora with SELinux enforcing, exporting a directory under `/home` also enables the `nfs_home_dirs` boolean. Guest side it mounts `172.16.0.1:<hostdir>` over SSH.
+Host side it manages `/etc/exports.d/fc-agents.exports` (`rw,no_subtree_check,root_squash,anonuid=<you>,anongid=<you>` — the guest is root-only, so instead of `no_root_squash` (guest root = host root, and every session-created file lands `root:root` on the host), guest root acts as **your uid/gid**: full access to your files, and everything created during a session — workspace edits, `.claude/` project dirs, token refreshes in `anthropic-config` — is owned by you, so cleanup never needs sudo), re-exports with `exportfs -ra`, ensures `nfs-server` is running, prunes entries whose host directory no longer exists, and — if firewalld is active — allows NFS (2049/tcp) from `172.16.0.0/24` in the TAP's zone. On Fedora with SELinux enforcing, exporting a directory under `/home` also enables the `nfs_home_dirs` boolean. Guest side it mounts `172.16.0.1:<hostdir>` over SSH.
+
+If you have files created during earlier `no_root_squash` sessions, fix them once with `sudo chown -R $USER: <dir>`.
 
 `--unmount` tears down both sides. The firewalld rule and `nfs-server` stay enabled (shared by all VMs, harmless). NFS is stateless, so `stop-vm.sh` needs no changes — a guest with mounted NFS shares simply keeps working after a host NFS restart.
 
