@@ -31,6 +31,11 @@ id_rsa.pub
 # because refresh tokens rotate on renewal).
 anthropic-config/
 
+# --- Claude Code session transcripts, shared out of the guest's /root/.claude ---
+# Holds full session content (prompts, file contents, tool output) — treat as
+# sensitive even though it isn't a credential.
+claude-sessions/
+
 # --- Runtime logs and per-VM state ---
 fc.log
 fc-vm*.log

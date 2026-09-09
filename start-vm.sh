@@ -10,6 +10,8 @@
 # ${SHARE_MNT:-/workspace} over NFS (see share-dir.sh) right after boot.
 # Combined with ./share-dir.sh <id> <dir> /root/.config/anthropic and
 # ANTHROPIC_PROFILE, this gives a live host workspace + auth for in-VM agents.
+# A third ./share-dir.sh <id> <dir> /root/.claude call likewise persists Claude
+# Code's session transcripts to the host instead of the guest's ext4 rootfs.
 #
 # Machine profile: VCPU_COUNT (default 2) and MEM_SIZE_MIB (default 2048) set
 # the guest's vCPU and memory. Applied at boot only — change them by restarting

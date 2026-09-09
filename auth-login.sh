@@ -61,7 +61,9 @@ cat <<EOF
 ==> Next steps (per session):
   1. SHARE_DIR=<your-workspace> ./start-vm.sh          # boots VM + NFS-mounts it at /workspace
   2. ./share-dir.sh 0 '$CONFIG_DIR' /root/.config/anthropic   # share the credentials (once)
-  3. ssh -i $FC_DIR/guest.id_rsa root@172.16.0.2
+  3. (optional) mkdir -p $FC_DIR/claude-sessions && ./share-dir.sh 0 '$FC_DIR/claude-sessions' /root/.claude
+       # persists session transcripts to the host instead of the guest's ext4 rootfs
+  4. ssh -i $FC_DIR/guest.id_rsa root@172.16.0.2
        cd /workspace && ANTHROPIC_PROFILE=$PROFILE claude
 
     anthropic-config/ holds live refresh tokens: never commit it, never copy it

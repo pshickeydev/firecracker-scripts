@@ -74,6 +74,7 @@ cd firecracker-scripts
 # 5. per session — boot with your workspace live-mounted, share credentials, run
 SHARE_DIR=~/some/project ./start-vm.sh 0
 ./share-dir.sh 0 "$PWD/anthropic-config" /root/.config/anthropic
+mkdir -p claude-sessions && ./share-dir.sh 0 "$PWD/claude-sessions" /root/.claude
 ssh -t -i guest.id_rsa root@172.16.0.2
      # then: cd /workspace && ANTHROPIC_PROFILE=fc-agents claude
 ```
@@ -159,6 +160,10 @@ SHARE_DIR=~/my-project ./start-vm.sh
 # 2. share the credentials once (they land in the guest at /root/.config/anthropic)
 ./share-dir.sh 0 "$PWD/anthropic-config" /root/.config/anthropic
 
+# 2b. (optional) share session transcripts too, so they persist on the host
+mkdir -p claude-sessions
+./share-dir.sh 0 "$PWD/claude-sessions" /root/.claude
+
 # 3. run Claude Code inside the VM, in your host workspace
 ssh -t -i guest.id_rsa root@172.16.0.2
 cd /workspace && ANTHROPIC_PROFILE=fc-agents claude
@@ -169,6 +174,17 @@ Why this works:
 - Claude Code **natively reads `ant` profiles**: with `ANTHROPIC_PROFILE=fc-agents` set, the `user_oauth` profile written by `ant auth login` outranks `/login`. Claude Code renews the token itself (using the `client_id` stored in the profile config) and adds the required `anthropic-beta: oauth-2025-04-20` header — no `ant` binary needed in the guest.
 - Because the credentials are NFS-mounted (not copied), renewal writes back through to the single shared copy — rotation-safe by construction. **Never `scp` these files into a VM.**
 - Files created in `/workspace` by the agent are your host files, immediately.
+
+**Session transcripts (2b).** Without this mount, Claude Code inside the guest
+writes its transcripts to `/root/.claude/projects/*.jsonl` on the guest's own
+ext4 rootfs — persistent across guest reboots, but invisible to the host and
+lost on the next `images`/`agent` rebuild. Mounting it out to `claude-sessions/`
+puts it on the host at `claude-sessions/projects/*/*.jsonl`, same shape as the
+native `~/.claude/projects`, so token-usage tooling that reads that layout
+(e.g. a cost estimator) can point `--root claude-sessions/projects` at it. It's
+gitignored. Unlike `anthropic-config/`, there's no rotation hazard here, so the
+same `claude-sessions/` dir can safely be shared to multiple VMs at once —
+each session writes its own UUID-named transcript file.
 
 ### `share-dir.sh` reference
 
@@ -307,6 +323,7 @@ ubuntu-<version>.squashfs.upstream
 squashfs-root/             # extracted rootfs tree the ext4 is built from
 guest.id_rsa / .pub        # dedicated SSH keypair (gitignored)
 anthropic-config/          # ant profile + credentials for the guest (gitignored, SECRET)
+claude-sessions/           # Claude Code transcripts shared out of /root/.claude (gitignored, optional)
 vmlinux-latest             # -> vmlinux-<version>
 ubuntu-latest.ext4         # -> ubuntu-<version>.ext4
 ubuntu-latest.id_rsa       # -> guest.id_rsa
