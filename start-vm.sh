@@ -4,7 +4,8 @@
 # Usage: ./start-vm.sh [VM_ID]    (VM_ID is a small integer, default 0)
 #
 # Each VM gets its own API socket, TAP device, and /30 subnet derived from VM_ID,
-# so you can run several concurrently.
+# so you can run several concurrently. Each is also its own trust domain: the
+# host firewall drops guest-to-guest traffic (see lib-fcnet.sh).
 #
 # Optional env: SHARE_DIR=<hostdir> mounts <hostdir> into the guest at
 # ${SHARE_MNT:-/workspace} over NFS (see share-dir.sh) right after boot.
@@ -16,6 +17,11 @@
 # Machine profile: VCPU_COUNT (default 2) and MEM_SIZE_MIB (default 2048) set
 # the guest's vCPU and memory. Applied at boot only — change them by restarting
 # the VM, not while it runs.
+#
+# Network policy env (see lib-fcnet.sh for the full ruleset):
+#   GUEST_LAN_ACCESS=1   let guests reach RFC1918 destinations (default: blocked)
+#   GUEST_HOST_PORTS=... host ports guests may reach (default: 2049, i.e. NFS)
+#   GUEST_HOST_FILTER=0  disable guest->host filtering entirely
 #
 # Layout (all under this repo's dir unless overridden via env):
 #   vmlinux-latest     -> guest kernel (symlink, managed by update-firecracker.sh)
@@ -30,16 +36,11 @@ set -euo pipefail
 # Default FC_DIR to this script's directory so the repo is self-contained.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FC_DIR="${FC_DIR:-$SCRIPT_DIR}"
-VM_ID="${VM_ID:-${1:-0}}"
-# VM_ID drives every derived value (socket, TAP, /30, MAC); ids above 63 would
-# overflow 172.16.0.0/24. 10# guards against bash treating "08" as a bad octal.
-if ! [[ "$VM_ID" =~ ^[0-9]+$ ]] || (( 10#$VM_ID > 63 )); then
-  echo "VM_ID must be an integer in 0..63 (got: '$VM_ID')" >&2
-  exit 1
-fi
-VM_ID=$((10#$VM_ID))
-# API sockets live in FC_SOCKET_DIR (default /tmp); API_SOCKET overrides the full path.
-SOCKET_DIR="${FC_SOCKET_DIR:-/tmp}"
+# shellcheck source=lib-fcnet.sh
+source "$SCRIPT_DIR/lib-fcnet.sh"
+
+VM_ID="$(fc_validate_vm_id "${VM_ID:-${1:-0}}")" || exit 1
+SOCKET_DIR="$(fc_ensure_socket_dir)"
 API_SOCKET="${API_SOCKET:-$SOCKET_DIR/firecracker-vm${VM_ID}.sock}"
 LOG_FILE="${FC_DIR}/fc-vm${VM_ID}.log"
 KERNEL="${KERNEL:-$FC_DIR/vmlinux-latest}"
@@ -60,14 +61,18 @@ if ! [[ "$MEM_SIZE_MIB" =~ ^[0-9]+$ ]] || (( MEM_SIZE_MIB < 128 )); then
   exit 1
 fi
 
+# Network-policy env: validate before ANY host state is created. fc_nft_apply
+# re-validates when it builds the ruleset, but that runs after the TAP is up —
+# a bad value there would die mid-flight and leave a stray device behind.
+# Assigning the normalized list back also makes the re-check a no-op.
+GUEST_HOST_PORTS="$(fc_guest_host_ports)"
+
 # Derive networking from VM_ID
-GUEST_LAST=$(( 2 + VM_ID * 4 ))
-HOST_LAST=$(( GUEST_LAST - 1 ))   # .1 of the /30
-GUEST_IP="172.16.0.${GUEST_LAST}"
-HOST_IP="172.16.0.${HOST_LAST}"
-TAP="fc${VM_ID}"
+GUEST_IP="$(fc_guest_ip "$VM_ID")"
+HOST_IP="$(fc_host_ip "$VM_ID")"
+TAP="$(fc_tap "$VM_ID")"
 # MAC: 06:00:AC:10:00:{GG}  -> guest IP 172.16.0.GG  (AC=172, 10=16, 00=0, GG)
-MAC_LAST=$(printf "%02x" "$GUEST_LAST")
+MAC_LAST=$(printf "%02x" "${GUEST_IP##*.}")
 MAC="06:00:ac:10:00:${MAC_LAST}"
 
 need() { command -v "$1" >/dev/null || { echo "missing: $1" >&2; exit 1; }; }
@@ -99,8 +104,21 @@ if ip link show "$TAP" >/dev/null 2>&1; then
   sudo ip link del "$TAP"
 fi
 sudo ip tuntap add dev "$TAP" mode tap
+# Disable IPv6 on the TAP *before* bringing it up, so it never gets a link-local
+# address. Everything here is IPv4 (the /30, the NAT, the NFS mount), and the
+# fc-nat rules are ip-family only — so a link-local on this device would be an
+# unfiltered path from the guest to any host service bound to ::, straight past
+# the guest->host filtering below. The guest keeps its own link-local; with the
+# host end gone there is nothing on the other side of it to reach.
+sudo sysctl -qw "net.ipv6.conf.${TAP}.disable_ipv6=1" 2>/dev/null || true
 sudo ip addr add "${HOST_IP}/30" dev "$TAP"
 sudo ip link set "$TAP" up
+# Verify: if the sysctl silently failed, say so rather than leaving the guest
+# with a quiet way around the input chain.
+if [ -n "$(ip -6 addr show dev "$TAP" scope link 2>/dev/null)" ]; then
+  echo "==> VM ${VM_ID}: warning — $TAP still has an IPv6 link-local address;" >&2
+  echo "    guest->host IPv6 is NOT filtered by the fc-nat rules (ip family only)" >&2
+fi
 # NAT so the guest can reach the internet.
 # 1) The host must route (net.ipv4.ip_forward): firewalld keeps it 0 unless a
 #    zone has masquerade, and without it guest packets never even reach the
@@ -113,20 +131,12 @@ fi
 if [ ! -f /etc/sysctl.d/99-fc-agents.conf ]; then
   echo 'net.ipv4.ip_forward=1' | sudo tee /etc/sysctl.d/99-fc-agents.conf >/dev/null
 fi
-# 2) nft NAT + forward rules.
-sudo nft add table ip fc-nat 2>/dev/null || true
-# (re)create the masquerade + forward rules; ignore "exists" errors.
-# NOTE on the masquerade direction: match by SOURCE subnet leaving via the
-# uplink (oifname != TAP). An earlier version masqueraded oifname "$TAP",
-# i.e. traffic ENTERING the tap (host->guest) — the wrong direction, so the
-# guest never had working outbound NAT (DNS/HTTPS all timed out).
-sudo nft 'add chain ip fc-nat postrouting { type nat hook postrouting priority 100 ; }' 2>/dev/null || true
-sudo nft add rule ip fc-nat postrouting ip saddr 172.16.0.0/24 oifname != "$TAP" counter masquerade 2>/dev/null || true
-sudo nft 'add chain ip fc-nat forward { type filter hook forward priority 0 ; }' 2>/dev/null || true
-sudo nft add rule ip fc-nat forward iifname "$TAP" oifname != "$TAP" counter accept 2>/dev/null || true
-sudo nft add rule ip fc-nat forward oifname "$TAP" iifname != "$TAP" counter accept 2>/dev/null || true
-# The adds above silently ignore "already exists" — but also real failures. Verify
-# the table is actually in place: a VM booted without NAT has no network at all.
+# 2) nft: rebuild the whole fc-nat table from the TAPs that exist right now.
+#    This is a single atomic transaction (and is validated with `nft -c` first),
+#    so it can neither leave the host half-configured nor accumulate a
+#    duplicate rule per boot. See fc_nft_apply in lib-fcnet.sh for the policy.
+echo "==> VM ${VM_ID}: applying host firewall rules (NAT + isolation)"
+fc_nft_apply
 sudo nft list chain ip fc-nat forward >/dev/null 2>&1 || {
   echo "nftables fc-nat setup failed (missing nft, or sudo not permitted?)" >&2
   exit 1
@@ -136,6 +146,12 @@ sudo nft list chain ip fc-nat forward >/dev/null 2>&1 || {
 # egress. The fix must put the TAP in the SAME zone as the uplink interface
 # (intra-zone forwarding), or firewalld's policy chain rejects fc0 -> uplink
 # traffic no matter what our own nft chains accept. NAT itself stays in nft.
+#
+# Deliberately RUNTIME-ONLY (no --permanent). A TAP is torn down with the VM,
+# so a permanent interface binding would outlive the device it names; and
+# --add-forward permanently enables intra-zone forwarding for EVERY interface
+# in that zone, which is a lasting relaxation of the host's firewall to buy a
+# per-session need. stop-vm.sh undoes the forward when the last VM goes away.
 if command -v firewall-cmd >/dev/null 2>&1 && sudo firewall-cmd --state >/dev/null 2>&1; then
   UPLINK="$(ip route show default 2>/dev/null | awk '{print $5; exit}')"
   if [ -n "${UPLINK:-}" ] \
@@ -145,18 +161,24 @@ if command -v firewall-cmd >/dev/null 2>&1 && sudo firewall-cmd --state >/dev/nu
   else
     FW_ZONE="$(sudo firewall-cmd --get-default-zone)"
   fi
-  echo "==> VM ${VM_ID}: firewalld — binding $TAP to zone '$FW_ZONE' + intra-zone forwarding"
+  echo "==> VM ${VM_ID}: firewalld — binding $TAP to zone '$FW_ZONE' + intra-zone forwarding (runtime only)"
   sudo firewall-cmd --zone="$FW_ZONE" --add-interface="$TAP" >/dev/null 2>&1 || true
-  sudo firewall-cmd --permanent --zone="$FW_ZONE" --add-interface="$TAP" >/dev/null 2>&1 || true
-  sudo firewall-cmd --zone="$FW_ZONE" --add-forward >/dev/null 2>&1 || true
-  sudo firewall-cmd --permanent --zone="$FW_ZONE" --add-forward >/dev/null 2>&1 || true
+  # Only enable forwarding if it wasn't already on, and record that WE turned
+  # it on so stop-vm.sh knows it is ours to turn back off.
+  if ! sudo firewall-cmd --zone="$FW_ZONE" --query-forward >/dev/null 2>&1; then
+    if sudo firewall-cmd --zone="$FW_ZONE" --add-forward >/dev/null 2>&1; then
+      echo "$FW_ZONE" > "$FC_DIR/.fw-forward-added"
+    fi
+  fi
 fi
 
 # --- Start firecracker, fully detached (immune to Ctrl+Z / terminal close) ---
 echo "==> VM ${VM_ID}: starting firecracker (log: $LOG_FILE)"
 rm -f "$LOG_FILE"
-setsid firecracker --api-sock "$API_SOCKET" >"$LOG_FILE" 2>&1 </dev/null &
-disown
+# umask 077 in the subshell so firecracker creates its API socket — a full
+# control channel over this VM — mode 0700, and the serial log (which carries
+# whatever the guest prints to its console) is not world-readable.
+( umask 077; setsid firecracker --api-sock "$API_SOCKET" >"$LOG_FILE" 2>&1 </dev/null & )
 
 # Wait for the API to come up (socket present AND endpoint responding).
 API_UP=0
@@ -224,13 +246,14 @@ if [ -n "${SHARE_DIR:-}" ]; then
   fi
 fi
 
+KNOWN_HOSTS="$(fc_known_hosts)"
 cat <<EOF
 
 ================ VM ${VM_ID} ready ================
   serial console log : tail -f $LOG_FILE
   api socket          : $API_SOCKET
                        curl --unix-socket $API_SOCKET http://localhost/machine-config | jq
-  ssh in              : ssh -i $SSH_KEY root@$GUEST_IP
+  ssh in              : ssh -i $SSH_KEY -o UserKnownHostsFile=$KNOWN_HOSTS root@$GUEST_IP
   stop                : ./stop-vm.sh $VM_ID
 ====================================================
 EOF
@@ -240,7 +263,7 @@ if [ -n "${SHARE_DIR:-}" ]; then
 
   workspace (NFS)     : $SHARE_DIR -> ${SHARE_MNT:-/workspace} (live in the guest)
   unshare             : ./share-dir.sh --unmount $VM_ID '$SHARE_DIR' ${SHARE_MNT:-/workspace}
-  run claude          : ssh -t -i $SSH_KEY root@$GUEST_IP
+  run claude          : ssh -t -i $SSH_KEY -o UserKnownHostsFile=$KNOWN_HOSTS root@$GUEST_IP
                        then: cd ${SHARE_MNT:-/workspace} && ANTHROPIC_PROFILE=fc-agents claude
 EOF
 fi

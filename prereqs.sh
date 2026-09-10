@@ -70,6 +70,7 @@ check_cmd wget         "image downloads"
 check_cmd unsquashfs   "rootfs extraction (squashfs-tools)"
 check_cmd mkfs.ext4    "rootfs image build (e2fsprogs)"
 check_cmd ssh-keygen   "guest SSH keypair generation"
+check_cmd sha256sum    "download checksum verification (coreutils)"
 check_cmd tar          "release archive extraction"
 check_cmd file         "image sanity check"
 echo

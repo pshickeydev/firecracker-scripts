@@ -5,7 +5,7 @@
 #   ./update-firecracker.sh binary     # update the firecracker binary from GitHub Releases
 #   ./update-firecracker.sh images     # update the guest kernel + Ubuntu rootfs from the CI S3 bucket
 #   ./update-firecracker.sh agent       # turn the extracted rootfs into an agent image
-#                                      # (DNS fix, nfs-common/rg, Claude Code, 2 GiB ext4,
+#                                      # (DNS fix, nfs-common, Claude Code, 2 GiB ext4,
 #                                      #  apt state stripped — no working package manager
 #                                      #  in the running guest)
 #   ./update-firecracker.sh all        # binary + images (default)
@@ -34,6 +34,90 @@ FORCE=0
 
 need() { command -v "$1" >/dev/null 2>&1 || { echo "missing required tool: $1" >&2; exit 1; }; }
 need curl; need jq; need wget; need unsquashfs; need mkfs.ext4; need ssh-keygen; need tar; need file; need grep
+need sha256sum
+
+# --- integrity ---------------------------------------------------------------
+#
+# Everything this script installs into the guest — and the VMM itself — arrives
+# over the network. Two different situations, handled differently:
+#
+#  * The Firecracker release publishes a .sha256 next to each artifact.
+#    Those are fetched and checked, and a mismatch is fatal.
+#
+#  * The Firecracker CI kernel/rootfs and the Claude Code installer publish no
+#    checksums at all, so there is nothing to verify against on a first fetch.
+#    Their hashes are instead recorded in image-pins.lock (committed) and
+#    checked on every later run. That does not protect the first fetch, but it
+#    does catch an artifact changing underneath a fixed name afterwards, and it
+#    makes the trust assumption visible in the repo instead of implicit.
+PINS_FILE="${PINS_FILE:-$FC_DIR/image-pins.lock}"
+
+sha256_of() { sha256sum "$1" | awk '{print $1}'; }
+
+verify_sha256() { # <file> <sha256-url> <label>
+  local expected got
+  expected="$(curl -fsSL "$2" 2>/dev/null | awk 'NR==1{print $1}')"
+  if [ -z "$expected" ]; then
+    if [ "${ALLOW_UNVERIFIED:-0}" = 1 ]; then
+      echo "    !! no published checksum for $3 — proceeding (ALLOW_UNVERIFIED=1)" >&2
+      return 0
+    fi
+    echo "no published checksum found for $3 ($2)" >&2
+    echo "refusing to install an unverified binary; set ALLOW_UNVERIFIED=1 to override" >&2
+    exit 1
+  fi
+  got="$(sha256_of "$1")"
+  if [ "$got" != "$expected" ]; then
+    echo "CHECKSUM MISMATCH for $3" >&2
+    echo "  expected: $expected" >&2
+    echo "  actual:   $got" >&2
+    exit 1
+  fi
+  echo "    sha256 verified against upstream: $3"
+}
+
+pin_lookup() { # <key> -> recorded hash, or empty
+  [ -f "$PINS_FILE" ] || return 0
+  awk -v k="$1" '$2==k {print $1; exit}' "$PINS_FILE"
+}
+
+pin_record() { # <key> <hash>
+  local tmp; tmp="$(mktemp)"
+  [ -f "$PINS_FILE" ] && awk -v k="$1" '$2!=k' "$PINS_FILE" >"$tmp"
+  printf '%s  %s\n' "$2" "$1" >>"$tmp"
+  sort -k2 "$tmp" -o "$tmp"
+  mv "$tmp" "$PINS_FILE"
+}
+
+pin_check() { # <file> <key> <strict|warn>
+  local got expected
+  got="$(sha256_of "$1")"
+  expected="$(pin_lookup "$2")"
+  if [ -z "$expected" ]; then
+    pin_record "$2" "$got"
+    echo "    pinned on first fetch: $2"
+    echo "      sha256 $got  (commit image-pins.lock to hold it)"
+    return 0
+  fi
+  if [ "$got" = "$expected" ]; then
+    echo "    sha256 matches the pin: $2"
+    return 0
+  fi
+  if [ "$3" = strict ] || [ "${STRICT_PINS:-0}" = 1 ]; then
+    echo "PIN MISMATCH for $2" >&2
+    echo "  pinned: $expected" >&2
+    echo "  actual: $got" >&2
+    echo "This artifact is published under a fixed name and should never change." >&2
+    echo "Investigate before proceeding; delete its line from $PINS_FILE to re-pin." >&2
+    exit 1
+  fi
+  echo "!!  CONTENT CHANGED since it was pinned: $2" >&2
+  echo "      pinned: $expected" >&2
+  echo "      actual: $got" >&2
+  echo "    This one is expected to change over time, so the new hash is being" >&2
+  echo "    recorded and the build continues. Use STRICT_PINS=1 to make it fatal." >&2
+  pin_record "$2" "$got"
+}
 
 # --- helpers ----------------------------------------------------------------
 
@@ -88,10 +172,11 @@ ensure_guest_key() {
 
 # --- agent subcommand ---------------------------------------------------------
 # Turns squashfs-root/ (from the `images` step) into an image ready for agent
-# sessions: working DNS, nfs-common via apt, a static ripgrep binary, the
-# stable Claude Code binary, and a 2 GiB rootfs so Claude Code's versioned
-# self-updates have headroom. Deliberately NO git in the guest — this limits
-# Claude Code's rewind capability inside the microVM (documented in the README).
+# sessions: working DNS, nfs-common via apt, the stable Claude Code binary, and
+# a 2 GiB rootfs so Claude Code's versioned self-updates have headroom.
+# Deliberately NO git in the guest — this limits Claude Code's rewind capability
+# inside the microVM (documented in the README). Also no ripgrep: Claude Code
+# ships its own and uses it for the Grep tool, so a separate rg was redundant.
 #
 # Package installation is build-time ONLY: after installing, all apt/dpkg state
 # is stripped from the shipped image (upstream-style appliance — see the strip
@@ -200,8 +285,18 @@ FCNET
 
   # 3. Claude Code native installer (stable channel). It bundles its own
   #    runtime — the guest needs no Node.js.
+  # Fetched to a file and hashed rather than piped straight into a shell, so
+  # the exact script that ran is pinned in image-pins.lock and a change is
+  # reported instead of passing through unseen. (It runs as root in the chroot,
+  # which has the host's /dev and /proc bind-mounted — see THREAT-MODEL.md.)
   echo "==> agent: running the Claude Code native installer (stable) in the chroot"
-  chroot_env bash -c 'curl -fsSL https://claude.ai/install.sh | bash -s stable'
+  local inst; inst="$(mktemp)"
+  curl -fsSL -o "$inst" https://claude.ai/install.sh
+  pin_check "$inst" "https://claude.ai/install.sh" warn
+  sudo install -m 755 "$inst" "$root/tmp/claude-install.sh"
+  rm -f "$inst"
+  chroot_env bash /tmp/claude-install.sh stable
+  sudo rm -f "$root/tmp/claude-install.sh"
   # claude's layout: ~/.local/bin/claude is a SYMLINK to
   # /root/.local/share/claude/versions/<v>. The symlink target is a
   # guest-absolute path, so it dangles when seen from the host tree — check the
@@ -234,18 +329,30 @@ FCNET
   # default PATH (matters for share-dir.sh and one-shot ssh commands).
   sudo ln -sfn /root/.local/bin/claude "$root/usr/local/bin/claude"
 
-  # 4. ripgrep: static musl binary fetched by the host — deliberately NOT via
-  #    apt, so the only thing pulling packages is mount.nfs (no static build).
-  echo "==> agent: installing ripgrep (static musl build)"
-  local rgver rgdir
-  rgver="$(curl -fsSL https://api.github.com/repos/BurntSushi/ripgrep/releases/latest | jq -r '.tag_name')"
-  rgdir="$(mktemp -d)"
-  curl -fsSL -o "$rgdir/rg.tgz" \
-    "https://github.com/BurntSushi/ripgrep/releases/download/$rgver/ripgrep-$rgver-x86_64-unknown-linux-musl.tar.gz"
-  tar -xzf "$rgdir/rg.tgz" -C "$rgdir"
-  sudo install -m 755 "$rgdir/ripgrep-$rgver-x86_64-unknown-linux-musl/rg" "$root/usr/bin/rg"
-  rm -rf "$rgdir"
-  echo "    rg $rgver -> /usr/bin/rg"
+  # 4. Guest hardening. The guest is reached only across its point-to-point TAP
+  #    using the repo's dedicated keypair, so nothing here costs us anything we
+  #    use — it just removes surface that the CI rootfs leaves switched on.
+  echo "==> agent: hardening the guest (sshd, root password, rpcbind)"
+  #    sshd: the CI image allows password auth, and ships root with an EMPTY
+  #    password field in /etc/shadow. Only PermitEmptyPasswords=no stands
+  #    between that and a passwordless root login. Turn password auth off and
+  #    lock the account; pubkey auth is unaffected by a locked password.
+  sudo install -d -m 755 "$root/etc/ssh/sshd_config.d"
+  sudo tee "$root/etc/ssh/sshd_config.d/10-fc-agents.conf" >/dev/null <<'SSHD'
+# Written by update-firecracker.sh (agent step).
+# The guest is reached over its /30 TAP with the repo's dedicated keypair only.
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitRootLogin prohibit-password
+SSHD
+  chroot_env passwd -l root >/dev/null 2>&1 \
+    || sudo sed -i 's/^root::/root:!:/' "$root/etc/shadow"
+  #    rpcbind: NFSv4 talks to port 2049 and nothing else, but installing
+  #    nfs-common pulls rpcbind in and it listens on 0.0.0.0:111 (tcp+udp).
+  #    Masking it is verified not to affect `mount -t nfs4`.
+  sudo install -d -m 755 "$root/etc/systemd/system"
+  sudo ln -sfn /dev/null "$root/etc/systemd/system/rpcbind.service"
+  sudo ln -sfn /dev/null "$root/etc/systemd/system/rpcbind.socket"
 
   # 5. The binds MUST come off before mkfs.ext4 -d, or the host's /proc ends
   #    up inside the image we build next.
@@ -285,6 +392,11 @@ FCNET
               "$AGENT_STAGE/var/log" \
               "$AGENT_STAGE/var/lib/ucf" \
               "$AGENT_STAGE/var/lib/python"
+  # ripgrep used to be installed here before we learned Claude Code bundles its
+  # own. Drop it from the shipped image so a re-run actually removes it: this
+  # step never deletes from squashfs-root, so a tree built by an older version
+  # would otherwise keep carrying /usr/bin/rg until an `images --force`.
+  sudo rm -f "$AGENT_STAGE/usr/bin/rg"
   # dpkg: empty the database dir entirely (upstream ships it empty; the
   # lock files are dpkg's own artifacts, not needed by anything at runtime).
   [ -d "$AGENT_STAGE/var/lib/dpkg" ] \
@@ -338,8 +450,11 @@ update_binary() {
   local tmpdir; tmpdir="$(mktemp -d)"
   trap 'rm -rf "$tmpdir"' RETURN
   local tgz="$tmpdir/firecracker-${latest}-${ARCH}.tgz"
+  local url="${GITHUB_RELEASES}/download/${latest}/firecracker-${latest}-${ARCH}.tgz"
   echo "==> Downloading firecracker-${latest}-${ARCH}.tgz"
-  curl -fSL -o "$tgz" "${GITHUB_RELEASES}/download/${latest}/firecracker-${latest}-${ARCH}.tgz"
+  curl -fSL -o "$tgz" "$url"
+  # Upstream publishes <artifact>.sha256.txt next to every release asset.
+  verify_sha256 "$tgz" "${url}.sha256.txt" "firecracker-${latest}-${ARCH}.tgz"
   tar -xzf "$tgz" -C "$tmpdir"
 
   local src="$tmpdir/release-${latest}-${ARCH}/firecracker-${latest}-${ARCH}"
@@ -382,12 +497,17 @@ update_images() {
 
   mkdir -p "$FC_DIR"
 
+  # The CI bucket publishes no checksums, so these are pinned on first fetch and
+  # verified afterwards. A dated CI key is immutable upstream: if the bytes
+  # behind one change, that is worth stopping for, hence strict.
   echo "==> Downloading kernel ($kernel_key)"
   wget -q -O "$FC_DIR/vmlinux-$latest_kernel_ver" "$S3/$kernel_key"
   file "$FC_DIR/vmlinux-$latest_kernel_ver"
+  pin_check "$FC_DIR/vmlinux-$latest_kernel_ver" "$kernel_key" strict
 
   echo "==> Downloading rootfs ($ubuntu_key)"
   wget -q -O "$FC_DIR/ubuntu-$ubuntu_version.squashfs.upstream" "$S3/$ubuntu_key"
+  pin_check "$FC_DIR/ubuntu-$ubuntu_version.squashfs.upstream" "$ubuntu_key" strict
 
   echo "==> Unsquashing + patching SSH key + building ext4"
   # The previous run chowned squashfs-root to root:root (for mkfs.ext4 -d), so a
@@ -399,6 +519,11 @@ update_images() {
   ensure_guest_key
   mkdir -p "$FC_DIR/squashfs-root/root/.ssh"
   cp "$SSH_KEY.pub" "$FC_DIR/squashfs-root/root/.ssh/authorized_keys"
+
+  # A fresh extract brings fresh SSH host keys, so every trust-on-first-use
+  # entry the scripts recorded is now stale. Drop the file instead of leaving
+  # the next ssh to fail with a host-key-changed warning.
+  rm -f "$FC_DIR/.known_hosts"
 
   sudo chown -R root:root "$FC_DIR/squashfs-root"
   local ext4="$FC_DIR/ubuntu-$ubuntu_version.ext4"

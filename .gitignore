@@ -49,3 +49,14 @@ release-v*/
 *.swp
 *.swo
 *~
+
+# --- Trust-on-first-use SSH host keys for the guests (regenerated per image) ---
+.known_hosts
+
+# --- Marker: firewalld intra-zone forwarding was enabled by start-vm.sh ---
+# stop-vm.sh reads this to know the relaxation is ours to undo.
+.fw-forward-added
+
+# NOTE: image-pins.lock is deliberately NOT ignored. It records the sha256 of
+# artifacts that publish no checksum of their own (the CI kernel/rootfs and the
+# Claude Code installer), so a later fetch can be checked against it.

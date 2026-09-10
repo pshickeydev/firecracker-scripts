@@ -20,22 +20,33 @@
 # No -e on purpose: every failure path below is an explicit if/|| check.
 set -uo pipefail
 
-SOCKET_DIR="${FC_SOCKET_DIR:-/tmp}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+FC_DIR="${FC_DIR:-$SCRIPT_DIR}"
+# shellcheck source=lib-fcnet.sh
+source "$SCRIPT_DIR/lib-fcnet.sh"
+
+SOCKET_DIR="$(fc_socket_dir)"
 
 need() { command -v "$1" >/dev/null || { echo "missing: $1" >&2; exit 1; }; }
 need curl; need jq; need pgrep; need ip; need ping
 
-# Collect VM ids: explicit args, or whatever sockets exist.
+# Collect VM ids: explicit args, or whatever sockets exist. /tmp is scanned too
+# so VMs booted by a pre-hardening start-vm.sh still show up rather than
+# looking like they are not running.
 if [ "$#" -gt 0 ]; then
   ids=("$@")
 else
   ids=()
-  for sock in "$SOCKET_DIR"/firecracker-vm*.sock; do
+  for sock in "$SOCKET_DIR"/firecracker-vm*.sock /tmp/firecracker-vm*.sock; do
     [ -e "$sock" ] || continue
     ids+=("$(basename "$sock" .sock | sed 's/^firecracker-vm//')")
   done
+  # dedupe: the same id can appear in both directories
+  if [ "${#ids[@]}" -gt 0 ]; then
+    mapfile -t ids < <(printf '%s\n' "${ids[@]}" | sort -nu)
+  fi
   if [ "${#ids[@]}" -eq 0 ]; then
-    echo "No firecracker VMs running (no sockets in $SOCKET_DIR)."
+    echo "No firecracker VMs running (no sockets in $SOCKET_DIR or /tmp)."
     exit 0
   fi
 fi
@@ -56,9 +67,9 @@ for id in "${ids[@]}"; do
   fi
   id=$((10#$id))
 
-  sock="${single_sock:-$SOCKET_DIR/firecracker-vm${id}.sock}"
-  guest="172.16.0.$(( 2 + id * 4 ))"
-  tap="fc${id}"
+  sock="${single_sock:-$(API_SOCKET= fc_api_socket "$id")}"
+  guest="$(fc_guest_ip "$id")"
+  tap="$(fc_tap "$id")"
 
   if [ ! -S "$sock" ]; then
     printf '%-4s %-14s %-5s %-8s %-5s %-9s %s\n' "$id" "$guest" "$tap" - - - absent

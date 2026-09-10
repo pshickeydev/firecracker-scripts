@@ -16,36 +16,30 @@
 # host TAP + NAT rules created by start-vm.sh.
 set -euo pipefail
 
-VM_ID="${VM_ID:-${1:-0}}"   # env wins over positional arg, matching start-vm.sh
-# VM_ID drives every derived value (socket, TAP, /30, MAC); ids above 63 would
-# overflow 172.16.0.0/24. 10# guards against bash treating "08" as a bad octal.
-if ! [[ "$VM_ID" =~ ^[0-9]+$ ]] || (( 10#$VM_ID > 63 )); then
-  echo "VM_ID must be an integer in 0..63 (got: '$VM_ID')" >&2
-  exit 1
-fi
-VM_ID=$((10#$VM_ID))
-# API sockets live in FC_SOCKET_DIR (default /tmp); API_SOCKET overrides the full path.
-SOCKET_DIR="${FC_SOCKET_DIR:-/tmp}"
-API_SOCKET="${API_SOCKET:-$SOCKET_DIR/firecracker-vm${VM_ID}.sock}"
-TAP="fc${VM_ID}"
-
-# Derived from VM_ID with the same convention as start-vm.sh, so we can reach
-# the guest over SSH for an orderly poweroff.
-GUEST_LAST=$(( 2 + VM_ID * 4 ))
-GUEST_IP="172.16.0.${GUEST_LAST}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FC_DIR="${FC_DIR:-$SCRIPT_DIR}"
+# shellcheck source=lib-fcnet.sh
+source "$SCRIPT_DIR/lib-fcnet.sh"
+
+VM_ID="$(fc_validate_vm_id "${VM_ID:-${1:-0}}")" || exit 1   # env wins over positional arg
+# fc_api_socket honors API_SOCKET / FC_SOCKET_DIR and falls back to the old
+# /tmp path, so a VM booted by a pre-hardening start-vm.sh is still stoppable.
+API_SOCKET="$(fc_api_socket "$VM_ID")"
+TAP="$(fc_tap "$VM_ID")"
+GUEST_IP="$(fc_guest_ip "$VM_ID")"
 SSH_KEY="${SSH_KEY:-$FC_DIR/guest.id_rsa}"
 # start-vm.sh points firecracker's stdout+stderr (serial console included) here
 # and rm -f's it on every boot, so a match below can never be stale from an
 # earlier run.
 LOG_FILE="${LOG_FILE:-$FC_DIR/fc-vm${VM_ID}.log}"
 
+fc_ssh_opts
 guest_poweroff() { # ask the guest to halt itself; returns 0 if the request went through
   command -v ssh >/dev/null || return 1
   [ -f "$SSH_KEY" ] || return 1
-  ssh -i "$SSH_KEY" -o BatchMode=yes -o ConnectTimeout=3 -o StrictHostKeyChecking=no \
-    -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR "root@$GUEST_IP" \
+  # ssh takes the FIRST value given for an option, so the shorter timeout has
+  # to precede the shared defaults from fc_ssh_opts.
+  ssh -i "$SSH_KEY" -o ConnectTimeout=3 "${FC_SSH_OPTS[@]}" "root@$GUEST_IP" \
     'sync; systemctl poweroff' >/dev/null 2>&1
 }
 
@@ -122,33 +116,45 @@ wait_halt() {
   done
 }
 
-echo "==> VM ${VM_ID}: requesting orderly shutdown (systemctl poweroff over ssh)"
 STOP_T0=$SECONDS
 
 if fc_alive; then
   rc=0; guest_halted || rc=$?
   if [ "$rc" -ne 1 ]; then
     echo "==> VM ${VM_ID}: guest already halted ($HALT_HOW)"
-  elif guest_poweroff; then
-    if wait_halt 45; then
-      echo "==> VM ${VM_ID}: guest halted cleanly in $(( SECONDS - STOP_T0 ))s ($HALT_HOW)"
-    else
-      echo "==> VM ${VM_ID}: poweroff accepted but no halt within 45s — killing; rootfs may replay journal on next boot" >&2
-    fi
   else
-    if wait_halt 8; then
-      echo "==> VM ${VM_ID}: ssh errored but guest halted anyway ($HALT_HOW)"
+    # The request message prints only when an ssh poweroff is actually sent;
+    # the already-halted and nothing-running paths never claim one.
+    echo "==> VM ${VM_ID}: requesting orderly shutdown (systemctl poweroff over ssh)"
+    if guest_poweroff; then
+      if wait_halt 45; then
+        echo "==> VM ${VM_ID}: guest halted cleanly in $(( SECONDS - STOP_T0 ))s ($HALT_HOW)"
+      else
+        echo "==> VM ${VM_ID}: poweroff accepted but no halt within 45s — killing; rootfs may replay journal on next boot" >&2
+      fi
     else
-      echo "==> VM ${VM_ID}: ssh unreachable, no halt evidence — killing; clean unmount NOT confirmed" >&2
+      if wait_halt 8; then
+        echo "==> VM ${VM_ID}: ssh errored but guest halted anyway ($HALT_HOW)"
+      else
+        echo "==> VM ${VM_ID}: ssh unreachable, no halt evidence — killing; clean unmount NOT confirmed" >&2
+      fi
     fi
   fi
 else
-  # No firecracker process for this id. Try ssh once anyway: if the VM was
-  # started with a renamed API_SOCKET it would otherwise be orphaned here.
-  if guest_poweroff; then
-    echo "==> VM ${VM_ID}: powered off a guest not tracked by $API_SOCKET"
+  # No firecracker process for this id. A VM started with a renamed API_SOCKET
+  # would otherwise be orphaned, so try ssh once — but ONLY if our TAP still
+  # exists. Without that check we would ssh into whatever happens to answer at
+  # this /30's guest address and power it off, which need not be our VM at all.
+  if ip link show "$TAP" >/dev/null 2>&1 || [ "${FORCE_POWEROFF:-0}" = 1 ]; then
+    echo "==> VM ${VM_ID}: requesting orderly shutdown (systemctl poweroff over ssh)"
+    if guest_poweroff; then
+      echo "==> VM ${VM_ID}: powered off a guest not tracked by $API_SOCKET"
+    else
+      echo "==> VM ${VM_ID}: no running VM (socket stale or absent) — cleaning up host side"
+    fi
   else
-    echo "==> VM ${VM_ID}: no running VM (socket stale or absent) — cleaning up host side"
+    echo "==> VM ${VM_ID}: no running VM and no $TAP — nothing here is ours; cleaning up host side"
+    echo "    (something else answering at $GUEST_IP is left alone; FORCE_POWEROFF=1 overrides)"
   fi
 fi
 
@@ -168,8 +174,10 @@ rm -f "$API_SOCKET"
 
 # Tear down host-side networking.
 echo "==> VM ${VM_ID}: tearing down $TAP"
-# Release the firewalld zone binding start-vm.sh created for the TAP (both
-# runtime + permanent), if any.
+# Release the firewalld zone binding start-vm.sh created for the TAP. The
+# --permanent removal is for entries written by older versions of start-vm.sh,
+# which used to persist a binding for a device that does not survive a reboot.
+FW_ZONE=""
 if command -v firewall-cmd >/dev/null 2>&1 && sudo firewall-cmd --state >/dev/null 2>&1; then
   FW_ZONE="$(sudo firewall-cmd --get-zone-of-interface="$TAP" 2>/dev/null || true)"
   if [ -n "$FW_ZONE" ]; then
@@ -178,6 +186,27 @@ if command -v firewall-cmd >/dev/null 2>&1 && sudo firewall-cmd --state >/dev/nu
   fi
 fi
 sudo ip link del "$TAP" 2>/dev/null || true
-# We leave the fc-nat table in place (harmless; reused by other VMs / next boot).
+
+# Rebuild the fc-nat table from the TAPs that remain, so this VM's rules go
+# away with it instead of lingering until the next boot. Done after the link is
+# deleted, so the ruleset describes reality. Never fatal: teardown must finish.
+if command -v nft >/dev/null 2>&1; then
+  ( fc_nft_apply ) || echo "warning: could not rebuild the fc-nat ruleset" >&2
+fi
+
+# If we were the ones who enabled firewalld intra-zone forwarding, and no VM is
+# left to need it, turn it back off rather than leaving the host's firewall
+# permanently relaxed by a session that has ended.
+FW_MARKER="$FC_DIR/.fw-forward-added"
+if [ -f "$FW_MARKER" ] && [ -z "$(fc_live_taps)" ]; then
+  if command -v firewall-cmd >/dev/null 2>&1 && sudo firewall-cmd --state >/dev/null 2>&1; then
+    MARKED_ZONE="$(cat "$FW_MARKER")"
+    echo "==> last VM stopped — removing firewalld intra-zone forwarding from '$MARKED_ZONE'"
+    sudo firewall-cmd --zone="$MARKED_ZONE" --remove-forward >/dev/null 2>&1 || true
+    # Older versions also wrote this permanently; clear that too.
+    sudo firewall-cmd --permanent --zone="$MARKED_ZONE" --remove-forward >/dev/null 2>&1 || true
+  fi
+  rm -f "$FW_MARKER"
+fi
 
 echo "==> VM ${VM_ID}: stopped"
