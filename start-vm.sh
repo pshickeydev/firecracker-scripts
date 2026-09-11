@@ -264,6 +264,6 @@ if [ -n "${SHARE_DIR:-}" ]; then
   workspace (NFS)     : $SHARE_DIR -> ${SHARE_MNT:-/workspace} (live in the guest)
   unshare             : ./share-dir.sh --unmount $VM_ID '$SHARE_DIR' ${SHARE_MNT:-/workspace}
   run claude          : ssh -t -i $SSH_KEY -o UserKnownHostsFile=$KNOWN_HOSTS root@$GUEST_IP
-                       then: cd ${SHARE_MNT:-/workspace} && ANTHROPIC_PROFILE=fc-agents claude
+                       then: cd ${SHARE_MNT:-/workspace} && ANTHROPIC_PROFILE=fc-agents IS_SANDBOX=1 claude --dangerously-skip-permissions
 EOF
 fi

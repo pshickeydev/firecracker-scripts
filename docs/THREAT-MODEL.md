@@ -31,6 +31,15 @@ contains something the host later executes (`Makefile`, `.git/hooks/*`,
 writes it gets code execution on the host the next time you run it. Share the
 project you are working on, not your home directory and not this repo.
 
+**Claude Code's permission prompts are not relied on as a boundary.** The
+in-VM agent is expected to run with `IS_SANDBOX=1 claude
+--dangerously-skip-permissions` (Claude Code refuses bypass mode when it
+detects root, and the guest is deliberately root-only — see
+AGENT-SESSIONS.md). The realistic adversary — a prompt injection — already has
+legitimate code execution inside the guest, so permission prompts would not
+stop it; the VM, the nftables rules, and the NFS export scope are the actual
+defenses. Skipping the prompts just removes friction.
+
 **A compromised session can exfiltrate the Anthropic refresh token.** The
 credentials are NFS-mounted into the guest because they must be a single shared
 copy (refresh tokens rotate). The guest has unrestricted outbound internet

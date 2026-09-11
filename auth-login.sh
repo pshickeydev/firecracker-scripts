@@ -64,7 +64,7 @@ cat <<EOF
   3. (optional) mkdir -p $FC_DIR/claude-sessions && ./share-dir.sh 0 '$FC_DIR/claude-sessions' /root/.claude
        # persists session transcripts to the host instead of the guest's ext4 rootfs
   4. ssh -i $FC_DIR/guest.id_rsa -o UserKnownHostsFile=$FC_DIR/.known_hosts root@172.16.0.2
-       cd /workspace && ANTHROPIC_PROFILE=$PROFILE claude
+       cd /workspace && ANTHROPIC_PROFILE=$PROFILE IS_SANDBOX=1 claude --dangerously-skip-permissions
 
     anthropic-config/ holds live refresh tokens: never commit it, never copy it
     into the VM by hand — always mount it over NFS so there is one shared copy.

@@ -56,7 +56,7 @@ mkdir -p claude-sessions
 
 # 3. run Claude Code inside the VM, in your host workspace
 ssh -t -i guest.id_rsa -o UserKnownHostsFile=.known_hosts root@172.16.0.2
-     # then: cd /workspace && ANTHROPIC_PROFILE=fc-agents claude
+     # then: cd /workspace && ANTHROPIC_PROFILE=fc-agents IS_SANDBOX=1 claude --dangerously-skip-permissions
 ```
 
 Why this works:
@@ -70,6 +70,29 @@ Why this works:
   through to the single shared copy — rotation-safe by construction.
   **Never `scp` these files into a VM.**
 - Files created in `/workspace` by the agent are your host files, immediately.
+
+## `--dangerously-skip-permissions` needs `IS_SANDBOX=1`
+
+Claude Code refuses bypass-permissions mode (`--dangerously-skip-permissions`)
+when it detects root/sudo privileges. The guest is deliberately root-only —
+the NFS `root_squash` + `anonuid` mapping relies on guest root acting as
+**your** uid on the host, so the sessions always trip that guard, and a
+non-root guest user would break file ownership instead of fixing anything.
+The intended escape hatch is `IS_SANDBOX=1`: it tells Claude Code the session
+is already confined (the value must be exactly `1`). Here that is simply
+true — the microVM is the sandbox, and the guest's only reach into the host
+is the NFS export of the directories you shared (see THREAT-MODEL.md:
+permission prompts are not relied on as a boundary; the adversary already
+has legitimate code execution inside the guest). The docs put it the same
+way: `--dangerously-skip-permissions` is sanctioned in "a container, VM, or
+the sandbox runtime". The guard gates the mode, not just the CLI flag — a
+`bypassPermissions` default in `~/.claude/settings.json` hits the same root
+check — so `IS_SANDBOX=1` must be in the environment either way.
+
+The first interactive bypass session also asks a one-time confirmation
+dialog before entering the mode; accept it once and it sticks for the
+config dir (`--bg` sessions are refused until an interactive session has
+accepted it).
 
 **Session transcripts (2b).** Without this mount, Claude Code inside the guest
 writes its transcripts to `/root/.claude/projects/*.jsonl` on the guest's own

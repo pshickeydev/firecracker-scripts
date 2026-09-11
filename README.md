@@ -79,7 +79,7 @@ SHARE_DIR=~/some/project ./start-vm.sh 0
 ./share-dir.sh 0 "$PWD/anthropic-config" /root/.config/anthropic
 mkdir -p claude-sessions && ./share-dir.sh 0 "$PWD/claude-sessions" /root/.claude
 ssh -t -i guest.id_rsa -o UserKnownHostsFile=.known_hosts root@172.16.0.2
-     # then: cd /workspace && ANTHROPIC_PROFILE=fc-agents claude
+     # then: cd /workspace && ANTHROPIC_PROFILE=fc-agents IS_SANDBOX=1 claude --dangerously-skip-permissions
 ```
 
 ### What it installs on the host
@@ -143,7 +143,7 @@ SHARE_DIR=~/project ./start-vm.sh
 ./share-dir.sh 0 "$PWD/anthropic-config" /root/.config/anthropic
 mkdir -p claude-sessions && ./share-dir.sh 0 "$PWD/claude-sessions" /root/.claude
 ssh -t -i guest.id_rsa -o UserKnownHostsFile=.known_hosts root@172.16.0.2
-# inside VM: cd /workspace && ANTHROPIC_PROFILE=fc-agents claude
+# inside VM: cd /workspace && ANTHROPIC_PROFILE=fc-agents IS_SANDBOX=1 claude --dangerously-skip-permissions
 ```
 
 ## Run a VM
