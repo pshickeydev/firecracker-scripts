@@ -76,9 +76,9 @@ cd firecracker-scripts
 
 # 5. per session — boot with your workspace live-mounted, share credentials, run
 SHARE_DIR=~/some/project ./start-vm.sh 0
-./share-dir.sh 0 "$PWD/anthropic-config" /root/.config/anthropic
+./share-dir.sh 0 ~/.config/anthropic-fc /root/.config/anthropic
 mkdir -p claude-sessions && ./share-dir.sh 0 "$PWD/claude-sessions" /root/.claude
-ssh -t -i guest.id_rsa -o UserKnownHostsFile=.known_hosts root@172.16.0.2
+ssh -t -i guest-vm0.id_rsa -o UserKnownHostsFile=.known_hosts root@172.16.0.2
      # then: cd /workspace && ANTHROPIC_PROFILE=fc-agents IS_SANDBOX=1 claude --dangerously-skip-permissions
 ```
 
@@ -100,7 +100,7 @@ The scripts keep everything they build (images, keys, logs, credentials) inside 
 
 ### Second-machine caveats
 
-- **`anthropic-config/` does not travel with the repo** (gitignored — it holds live refresh tokens). On another machine, run `./auth-login.sh` there. The same account can hold the profile refreshed from multiple hosts, but never keep **two copies of the same profile mounted at the same time** — refresh-token rotation would orphan one of them (the rotation hazard, below).
+- **The credential dir does not travel with the repo** (`~/.config/anthropic-fc` by default, outside it; a legacy `./anthropic-config` is gitignored — both hold live refresh tokens). On another machine, run `./auth-login.sh` there. The same account can hold the profile refreshed from multiple hosts, but never keep **two copies of the same profile mounted at the same time** — refresh-token rotation would orphan one of them (the rotation hazard, below).
 - The `172.16.0.0/24` range must not collide with an existing route on the host; if it does, change `FC_SUBNET` in `lib-fcnet.sh` and the matching derivation in `start-vm.sh`.
 - Guest DNS is baked as `1.1.1.1`/`8.8.8.8` — fine unless the network blocks external resolvers.
 - The firewalld and SELinux paths auto-detect; on hosts without them (e.g. Debian-family with ufw, no SELinux) the guards simply skip.
@@ -140,9 +140,9 @@ Quick version:
 
 # per session — boot with workspace mounted, share auth, ssh in
 SHARE_DIR=~/project ./start-vm.sh
-./share-dir.sh 0 "$PWD/anthropic-config" /root/.config/anthropic
+./share-dir.sh 0 ~/.config/anthropic-fc /root/.config/anthropic
 mkdir -p claude-sessions && ./share-dir.sh 0 "$PWD/claude-sessions" /root/.claude
-ssh -t -i guest.id_rsa -o UserKnownHostsFile=.known_hosts root@172.16.0.2
+ssh -t -i guest-vm0.id_rsa -o UserKnownHostsFile=.known_hosts root@172.16.0.2
 # inside VM: cd /workspace && ANTHROPIC_PROFILE=fc-agents IS_SANDBOX=1 claude --dangerously-skip-permissions
 ```
 
@@ -153,7 +153,8 @@ ssh -t -i guest.id_rsa -o UserKnownHostsFile=.known_hosts root@172.16.0.2
 ./start-vm.sh
 
 # ssh in
-ssh -i guest.id_rsa -o UserKnownHostsFile=.known_hosts root@172.16.0.2
+ssh -i guest-vm0.id_rsa -o UserKnownHostsFile=.known_hosts root@172.16.0.2
+# (start-vm.sh prints this line with the key that VM actually got)
 
 # see what's running (or stale)
 ./list-vms.sh
@@ -161,6 +162,40 @@ ssh -i guest.id_rsa -o UserKnownHostsFile=.known_hosts root@172.16.0.2
 # stop it
 ./stop-vm.sh
 ```
+
+### Rootfs isolation
+
+Each VM gets its own writable bytes, and the shared base image is attached
+**read-only**. A guest can neither corrupt another VM's filesystem nor backdoor
+the image the next VM boots from.
+
+```bash
+./start-vm.sh 0                      # read-only base + vm0-layer.ext4 (overlay)
+RESET_LAYER=1 ./start-vm.sh 0        # throw this VM's writable bytes away first
+ROOTFS_MODE=copy ./start-vm.sh 0     # per-VM copy instead (no initrd needed)
+```
+
+`ROOTFS_MODE` is `auto` by default: overlay when `initrd-overlay.img` exists
+(built by `./update-firecracker.sh agent`), otherwise a per-VM copy. Booting a
+VM off an image another VM already has attached is refused either way.
+
+Each VM also gets its own SSH key, `guest-vm<id>.id_rsa`, generated on first
+boot — one guest's key is not root on every other guest.
+
+### Restricting what a guest can reach
+
+Guest egress is unrestricted by default. To allow only specific destinations:
+
+```bash
+GUEST_EGRESS_ALLOW=api.anthropic.com,registry.npmjs.org ./start-vm.sh 0
+```
+
+Names are resolved on the host when the firewall rules are built, so for
+CDN-fronted hosts the set can go stale.
+
+There is one firewall table for all VMs, so the policy is host-wide and is
+remembered until the last VM stops: stopping one VM does not un-restrict the
+others. `GUEST_EGRESS_ALLOW=` (empty) clears it.
 
 ### Clean shutdown, concurrent VMs, and runtime details
 
@@ -198,10 +233,10 @@ firecracker-scripts/
 ├── lib-fcnet.sh           # sourced by the four VM scripts (not executable on its own)
 ├── image-pins.lock        # sha256 of artifacts that publish no checksum (committed)
 ├── README.md
-├── docs/THREAT-MODEL.md
 ├── docs/
 │   ├── AGENT-SESSIONS.md
-│   └── RUNTIME.md
+│   ├── RUNTIME.md
+│   └── THREAT-MODEL.md
 └── .gitignore
 ```
 
@@ -213,8 +248,15 @@ vmlinux-<version>          # guest kernel
 ubuntu-<version>.ext4      # guest rootfs (agent step: 2 GiB, claude, nfs-common, apt state stripped)
 ubuntu-<version>.squashfs.upstream
 squashfs-root/             # extracted rootfs tree the ext4 is built from
-guest.id_rsa / .pub        # dedicated SSH keypair (gitignored)
-anthropic-config/          # ant profile + credentials for the guest (gitignored, SECRET)
+initrd-overlay.img         # overlay-root initrd: read-only base + per-VM layer
+vm<id>-layer.ext4          # per-VM writable overlay layer (sparse; holds everything
+                           #   a session wrote, including that VM's journal)
+vm<id>.ext4                # per-VM rootfs copy, when ROOTFS_MODE=copy
+guest-vm<id>.id_rsa / .pub # per-VM SSH keypair, generated on first boot (SECRET)
+guest.id_rsa / .pub        # shared fallback SSH keypair (gitignored)
+anthropic-config/          # legacy location of the ant profile (gitignored, SECRET);
+                           #   new logins default to ~/.config/anthropic-fc instead,
+                           #   outside the repo — see auth-login.sh
 claude-sessions/           # Claude Code transcripts shared out of /root/.claude (gitignored, optional)
 vmlinux-latest             # -> vmlinux-<version>
 ubuntu-latest.ext4         # -> ubuntu-<version>.ext4
@@ -222,4 +264,6 @@ ubuntu-latest.id_rsa       # -> guest.id_rsa
 fc-vm*.log                 # per-VM serial console logs (mode 0600)
 .known_hosts               # TOFU guest host keys; deleted on an images rebuild
 .fw-forward-added          # marker: we enabled firewalld intra-zone forwarding
+.fc-egress-policy          # the egress allowlist in force (survives stop-vm.sh; see
+                           #   GUEST_EGRESS_ALLOW). Removed when the last VM stops.
 ```

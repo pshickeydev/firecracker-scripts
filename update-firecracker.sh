@@ -182,9 +182,165 @@ ensure_guest_key() {
 # is stripped from the shipped image (upstream-style appliance — see the strip
 # step below), so the running guest has no working package manager. To add a
 # package, put it in AGENT_APT_PKGS and re-run this step.
-AGENT_APT_PKGS=(nfs-common)
+# busybox-static is build-time only: copied into the initrd, then stripped
+# from the shipped rootfs so the guest gains no multi-call shell.
+AGENT_APT_PKGS=(nfs-common busybox-static)
 AGENT_ROOT=""    # global: the EXIT trap below must not reference locals
 AGENT_STAGE=""   # global: staged hardlink copy the ext4 is built from
+
+# A layer (or copy) only means anything against the base it was created over.
+# Rebuilding does not delete them (they hold session state), so warn about
+# stale ones — like the .known_hosts reset does for host keys.
+warn_stale_layers() {
+  local f
+  local -a stale=()
+  # One glob: vm[0-9]*.ext4 already covers vm0-layer.ext4 as well as vm0.ext4.
+  for f in "$FC_DIR"/vm[0-9]*.ext4; do
+    [ -e "$f" ] || continue
+    stale+=("$(basename "$f")")
+  done
+  [ "${#stale[@]}" -gt 0 ] || return 0
+  echo
+  echo "==> NOTE: these per-VM images predate the base image just built:"
+  printf '      %s\n' "${stale[@]}"
+  echo "    They overlay (or copy) the OLD base. Start those VMs with RESET_LAYER=1,"
+  echo "    or delete the files — after copying out anything worth keeping. A VM's"
+  echo "    journal lives in its layer, under upper/var/log/journal."
+}
+
+# --- overlay-root initrd ------------------------------------------------------
+# ROOTFS_MODE=overlay attaches the shared base read-only plus a per-VM writable
+# layer. Assembling a root from two devices has to happen before init, which is
+# what an initramfs is for: a gzipped cpio holding one static busybox (deleted
+# from the shipped rootfs) and the /init below.
+build_overlay_initrd() { # <tree-containing-busybox> <out.img>
+  local tree="$1" out="$2" bb="" cand stage applets missing=""
+  need cpio; need gzip
+  for cand in usr/bin/busybox bin/busybox usr/sbin/busybox sbin/busybox; do
+    if sudo test -x "$tree/$cand"; then bb="$tree/$cand"; break; fi
+  done
+  [ -n "$bb" ] || {
+    echo "busybox not found under $tree — is busybox-static in AGENT_APT_PKGS?" >&2
+    exit 1
+  }
+
+  stage="$(mktemp -d)"
+  mkdir -p "$stage"/bin "$stage"/proc "$stage"/sys "$stage"/dev \
+           "$stage"/base "$stage"/layer "$stage"/newroot
+  sudo cp "$bb" "$stage/bin/busybox"
+  sudo chown -R "$(id -u):$(id -g)" "$stage"
+  chmod 755 "$stage/bin/busybox"
+
+  # Verify the applets /init needs are compiled in before shipping an image
+  # that cannot boot (switch_root missing = hang in the initramfs every time).
+  applets="$("$stage/bin/busybox" --list 2>/dev/null || true)"
+  for cand in sh mount umount mkdir cat sleep switch_root; do
+    printf '%s\n' "$applets" | grep -qx "$cand" || missing="$missing $cand"
+  done
+  [ -z "$missing" ] || {
+    rm -rf "$stage"
+    echo "the image's busybox lacks applets needed by the overlay initrd:$missing" >&2
+    exit 1
+  }
+  printf '%s\n' "$applets" | grep -qx findfs \
+    || echo "    note: this busybox has no findfs — /init falls back to /dev/vdb for the layer"
+
+  cat >"$stage/init" <<'INIT'
+#!/bin/busybox sh
+# /init — assemble the guest root from the read-only base (/dev/vda) plus this
+# VM's writable layer (/dev/vdb), then switch_root to systemd. Must run as PID 1
+# from an initramfs: / cannot be pivoted onto an overlay once systemd started.
+
+BB=/bin/busybox
+
+log() { echo "initrd: $*"; }
+
+# Park the VM on failure rather than panicking: panic=1 would reboot in a
+# loop and scroll the reason off the serial log.
+fail() {
+    log "FATAL: $*"
+    log "hint: the base is mounted read-only, and a read-only mount cannot"
+    log "      replay an ext4 journal — 'e2fsck -fy <base>.ext4' on the host"
+    log "      with every VM stopped is the usual fix."
+    log "this VM is parked; stop it with ./stop-vm.sh <id>"
+    while :; do $BB sleep 60; done
+}
+
+# Get a mount out of the initramfs tree. Try both spellings of move (`-o move`
+# is busybox's); a lazy detach is equally fine — overlayfs keeps its own
+# reference to both layers.
+relocate() { # <from> <to>
+    $BB mount -o move "$1" "$2" 2>/dev/null && return 0
+    $BB mount --move  "$1" "$2" 2>/dev/null && return 0
+    if $BB umount -l "$1" 2>/dev/null; then
+        log "note: $1 was lazily detached instead of moved to $2"
+        return 0
+    fi
+    log "warning: $1 stayed in the initramfs tree; switch_root skips mount"
+    log "         points when it clears the old root, so this is untidy, not fatal"
+    return 0
+}
+
+$BB mkdir -p /proc /sys /dev /base /layer /newroot
+$BB mount -t proc     proc     /proc 2>/dev/null
+$BB mount -t sysfs    sysfs    /sys  2>/dev/null
+$BB mount -t devtmpfs devtmpfs /dev  2>/dev/null
+
+# The layer is found by LABEL (not device order); /dev/vdb is a sound fallback
+# since the base is always added first.
+LAYER="$($BB findfs LABEL=fc-layer 2>/dev/null)"
+[ -n "$LAYER" ] || LAYER=/dev/vdb
+
+# The base is whatever firecracker named as the root device.
+BASE=/dev/vda
+for arg in $($BB cat /proc/cmdline 2>/dev/null); do
+    case "$arg" in
+        root=*) BASE="${arg#root=}" ;;
+    esac
+done
+case "$BASE" in
+    LABEL=*|UUID=*) BASE="$($BB findfs "$BASE" 2>/dev/null)" ;;
+esac
+[ -n "$BASE" ] || BASE=/dev/vda
+[ "$BASE" != "$LAYER" ] || fail "base and layer are the same device ($BASE)"
+
+log "base=$BASE (read-only)  layer=$LAYER (read-write)"
+$BB mount -t ext4 -o ro "$BASE" /base || fail "could not mount $BASE read-only"
+# Deliberately no nosuid/noexec: this becomes the guest's /, and the image
+# ships a suid mount.nfs that share-dir.sh depends on.
+$BB mount -t ext4 "$LAYER" /layer || fail "could not mount $LAYER read-write"
+
+$BB mkdir -p /layer/upper /layer/work
+$BB mount -t overlay overlay \
+    -o lowerdir=/base,upperdir=/layer/upper,workdir=/layer/work /newroot \
+    || fail "could not assemble the overlay root"
+
+[ -x /newroot/sbin/init ] || fail "no /sbin/init in the assembled root"
+
+# overlayfs pins both layers, so relocate them into the new root (/mnt/fc-base
+# also exposes the pristine base from inside the guest). Never fatal.
+$BB mkdir -p /newroot/mnt/fc-base /newroot/mnt/fc-layer
+relocate /base  /newroot/mnt/fc-base
+relocate /layer /newroot/mnt/fc-layer
+
+$BB umount /dev  2>/dev/null
+$BB umount /sys  2>/dev/null
+$BB umount /proc 2>/dev/null
+exec $BB switch_root /newroot /sbin/init
+
+# Only reached if exec failed; falling off the end would panic into a reboot
+# loop.
+fail "switch_root did not take — the assembled root is unusable"
+INIT
+  chmod 755 "$stage/init"
+
+  # -R 0:0 so the archive says root owns everything regardless of who built it.
+  ( cd "$stage" && find . -print0 \
+      | cpio --null --create --format=newc -R 0:0 --quiet ) | gzip -9 >"$out"
+  rm -rf "$stage"
+  [ -s "$out" ] || { echo "failed to build $out" >&2; exit 1; }
+  echo "==> agent: overlay initrd: $out ($(du -h "$out" | cut -f1))"
+}
 
 agent_umount_binds() {
   # Drop any /proc /dev /sys bind-mounts left in the guest tree (a previous
@@ -353,6 +509,33 @@ SSHD
   sudo install -d -m 755 "$root/etc/systemd/system"
   sudo ln -sfn /dev/null "$root/etc/systemd/system/rpcbind.service"
   sudo ln -sfn /dev/null "$root/etc/systemd/system/rpcbind.socket"
+  #    sysctls: modules_disabled was previously observed set at runtime by
+  #    nothing in this repo — set it for real. Safe: the image ships no
+  #    /lib/modules (everything the guest uses is built into the kernel).
+  #    dmesg_restrict is correct the moment not everything runs as root.
+  sudo install -d -m 755 "$root/etc/sysctl.d"
+  sudo tee "$root/etc/sysctl.d/99-fc-agents-hardening.conf" >/dev/null <<'SYSCTL'
+# Written by update-firecracker.sh. modules_disabled is one-way; this image
+# ships no modules, so nothing is given up.
+kernel.modules_disabled = 1
+kernel.dmesg_restrict = 1
+SYSCTL
+  #    debugfs publishes kernel internals and is read by nothing here. Masking
+  #    the unit beats debugfs=off, which would fail the mount and leave the
+  #    guest degraded for the same nothing.
+  sudo ln -sfn /dev/null "$root/etc/systemd/system/sys-kernel-debug.mount"
+  #    Make the journal persistent: under overlay mode it lands in the VM's
+  #    layer, which outlives the guest and is readable from the host.
+  sudo install -d -m 755 "$root/etc/systemd/journald.conf.d"
+  sudo tee "$root/etc/systemd/journald.conf.d/10-fc-agents.conf" >/dev/null <<'JOURNALD'
+# Written by update-firecracker.sh (agent step).
+[Journal]
+Storage=persistent
+SystemMaxUse=128M
+JOURNALD
+  #    Layer mountpoints for the overlay initrd (it mkdir's them as a fallback;
+  #    the CI rootfs ships no /mnt at all).
+  sudo install -d -m 755 "$root/mnt" "$root/mnt/fc-base" "$root/mnt/fc-layer"
 
   # 5. The binds MUST come off before mkfs.ext4 -d, or the host's /proc ends
   #    up inside the image we build next.
@@ -409,6 +592,21 @@ SSHD
   sudo test ! -e "$AGENT_STAGE/var/lib/apt/lists" || {
     echo "strip failed: apt lists still present" >&2; exit 1; }
 
+  # 6b. Overlay-root initrd, built from the BUILD tree (which still has
+  #     busybox); busybox is then dropped from the staged copy. rm only unlinks
+  #     the stage's name — squashfs-root keeps its hardlink, so re-runs are no-ops.
+  echo "==> agent: building the overlay-root initrd"
+  build_overlay_initrd "$root" "$FC_DIR/initrd-overlay.img"
+  sudo rm -f "$AGENT_STAGE/usr/bin/busybox" "$AGENT_STAGE/bin/busybox"
+
+  # 6c. The strip removed /var/log; recreate the journal dir. Read the gid from
+  #     the image's /etc/group — the host's systemd-journal gid differs.
+  local jgid
+  jgid="$(sudo awk -F: '/^systemd-journal:/ {print $3}' "$root/etc/group" 2>/dev/null || true)"
+  [ -n "$jgid" ] || jgid=0
+  sudo install -d -m 755  -o 0 -g 0      "$AGENT_STAGE/var/log"
+  sudo install -d -m 2755 -o 0 -g "$jgid" "$AGENT_STAGE/var/log/journal"
+
   # 7. Rebuild the ext4, grown from 1 GiB to 2 GiB — headroom for Claude
   #    Code's versioned self-updates (each downloaded release is ~300 MB),
   #    not for package installs: the guest ships no working package manager.
@@ -431,6 +629,7 @@ SSHD
   trap - EXIT
   echo "==> agent: done — guest image ready:"
   ls -la "$FC_DIR/ubuntu-latest.ext4"
+  warn_stale_layers
 }
 
 # --- subcommands ------------------------------------------------------------
@@ -546,6 +745,7 @@ update_images() {
 
   echo "==> Images ready:"
   ls -la "$FC_DIR/vmlinux-latest" "$FC_DIR/ubuntu-latest.ext4" "$FC_DIR/ubuntu-latest.id_rsa"
+  warn_stale_layers
 }
 
 # --- arg parse --------------------------------------------------------------

@@ -27,7 +27,9 @@ VM_ID="$(fc_validate_vm_id "${VM_ID:-${1:-0}}")" || exit 1   # env wins over pos
 API_SOCKET="$(fc_api_socket "$VM_ID")"
 TAP="$(fc_tap "$VM_ID")"
 GUEST_IP="$(fc_guest_ip "$VM_ID")"
-SSH_KEY="${SSH_KEY:-$FC_DIR/guest.id_rsa}"
+# The key that reaches THIS VM — the wrong one makes a healthy guest look dead
+# and sends stop-vm.sh down its kill path instead of an orderly poweroff.
+SSH_KEY="$(fc_ssh_key "$VM_ID")"
 # start-vm.sh points firecracker's stdout+stderr (serial console included) here
 # and rm -f's it on every boot, so a match below can never be stale from an
 # earlier run.
@@ -207,6 +209,16 @@ if [ -f "$FW_MARKER" ] && [ -z "$(fc_live_taps)" ]; then
     sudo firewall-cmd --permanent --zone="$MARKED_ZONE" --remove-forward >/dev/null 2>&1 || true
   fi
   rm -f "$FW_MARKER"
+fi
+
+# The egress policy is host-wide (one fc-nat table), not per VM. Forget it once
+# the last VM stops, so a later start-vm.sh does not inherit a policy nobody
+# asked for.
+if [ -z "$(fc_live_taps)" ]; then
+  if [ -e "$(fc_egress_state_file)" ]; then
+    echo "==> last VM stopped — forgetting the egress allowlist policy"
+  fi
+  fc_egress_forget
 fi
 
 echo "==> VM ${VM_ID}: stopped"

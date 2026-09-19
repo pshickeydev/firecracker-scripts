@@ -9,7 +9,11 @@
 # one explicit id, API_SOCKET is honored like in start-vm.sh, so a non-default
 # socket path can be probed.
 #
-# Columns: VM  GUEST IP  TAP  FC PID  vCPU  MEM (MB)  STATUS
+# Columns: VM  GUEST IP  TAP  FC PID  vCPU  MEM (MB)  ROOTFS  STATUS
+#
+# ROOTFS: which bytes the VM runs on — overlay:<layer> (read-only base + this
+# VM's writable layer) or rw:<image> (writable root) — so you can confirm no VM
+# is writing an image another VM has open.
 #
 # STATUS is one of:
 #   up        firecracker running and guest answers ping
@@ -57,12 +61,12 @@ if [ "$#" -eq 1 ] && [ -n "${API_SOCKET:-}" ]; then
   single_sock="$API_SOCKET"
 fi
 
-printf '%-4s %-14s %-5s %-8s %-5s %-9s %s\n' VM "GUEST IP" TAP "FC PID" VCPU "MEM (MB)" STATUS
+printf '%-4s %-14s %-5s %-8s %-5s %-9s %-22s %s\n' VM "GUEST IP" TAP "FC PID" VCPU "MEM (MB)" ROOTFS STATUS
 
 for id in "${ids[@]}"; do
   # Sanity-check the id (10# defuses leading zeros like "08").
   if ! [[ "$id" =~ ^[0-9]+$ ]] || (( 10#$id > 63 )); then
-    printf '%-4s %-14s %-5s %-8s %-5s %-9s %s\n' "$id" - - - - - "bad id (must be 0..63)"
+    printf '%-4s %-14s %-5s %-8s %-5s %-9s %-22s %s\n' "$id" - - - - - - "bad id (must be 0..63)"
     continue
   fi
   id=$((10#$id))
@@ -72,7 +76,7 @@ for id in "${ids[@]}"; do
   tap="$(fc_tap "$id")"
 
   if [ ! -S "$sock" ]; then
-    printf '%-4s %-14s %-5s %-8s %-5s %-9s %s\n' "$id" "$guest" "$tap" - - - absent
+    printf '%-4s %-14s %-5s %-8s %-5s %-9s %-22s %s\n' "$id" "$guest" "$tap" - - - - absent
     continue
   fi
 
@@ -80,7 +84,7 @@ for id in "${ids[@]}"; do
   # Liveness endpoint: GET /machine-config answers 200 even before
   # configuration (the old /instance-info is gone from current Firecracker APIs).
   if ! config="$(curl -sf --max-time 1 --unix-socket "$sock" http://localhost/machine-config 2>/dev/null)"; then
-    printf '%-4s %-14s %-5s %-8s %-5s %-9s %s\n' "$id" "$guest" "$tap" - - - "stale (run ./stop-vm.sh $id)"
+    printf '%-4s %-14s %-5s %-8s %-5s %-9s %-22s %s\n' "$id" "$guest" "$tap" - - - - "stale (run ./stop-vm.sh $id)"
     continue
   fi
 
@@ -90,6 +94,25 @@ for id in "${ids[@]}"; do
   vcpu="$(jq -r '.vcpu_count // "-"' <<<"$config")"
   mem="$(jq -r '.mem_size_mib // "-"' <<<"$config")"
 
+  # Which bytes is this VM running on? GET /vm/config reports the drives of a
+  # configured VM (column meanings in the header); degrades to "-" on older
+  # Firecracker that lacks the endpoint.
+  rootfs="-"
+  if vmcfg="$(curl -sf --max-time 1 --unix-socket "$sock" http://localhost/vm/config 2>/dev/null)"; then
+    rootfs="$(jq -r '
+      [.. | objects | select(has("path_on_host"))] as $d
+      | ($d | map(select(.is_root_device == true)) | first) as $r
+      | ($d | map(select(.is_root_device != true)) | first) as $x
+      | if $r == null then "-"
+        elif ($r.is_read_only == true) and ($x != null)
+          then "overlay:" + ($x.path_on_host | split("/") | last)
+        elif ($r.is_read_only == true)
+          then "ro:" + ($r.path_on_host | split("/") | last)
+        else "rw:" + ($r.path_on_host | split("/") | last)
+        end' <<<"$vmcfg" 2>/dev/null)"
+    [ -n "$rootfs" ] || rootfs="-"
+  fi
+
   if ping -c1 -W1 "$guest" >/dev/null 2>&1; then
     status=up
   elif ! ip link show "$tap" >/dev/null 2>&1; then
@@ -98,5 +121,5 @@ for id in "${ids[@]}"; do
     status=running
   fi
 
-  printf '%-4s %-14s %-5s %-8s %-5s %-9s %s\n' "$id" "$guest" "$tap" "${pid:--}" "$vcpu" "$mem" "$status"
+  printf '%-4s %-14s %-5s %-8s %-5s %-9s %-22s %s\n' "$id" "$guest" "$tap" "${pid:--}" "$vcpu" "$mem" "$rootfs" "$status"
 done

@@ -87,13 +87,28 @@ SHARE_DIR=~/project ./start-vm.sh          # live-mount ~/project at /workspace 
 SHARE_DIR=~/project SHARE_MNT=/work ./start-vm.sh  # ...or at a custom guest path
 VCPU_COUNT=4 MEM_SIZE_MIB=8192 ./start-vm.sh   # override the machine profile (default: 2 vCPU / 2048 MiB)
 AGENT_PROFILE=fc-agents ./auth-login.sh    # auth profile name (default fc-agents)
-ANTHROPIC_CONFIG_DIR=... ./auth-login.sh   # ant's config dir (default <repo>/anthropic-config)
+ANTHROPIC_CONFIG_DIR=... ./auth-login.sh   # ant's config dir (default ~/.config/anthropic-fc,
+                                           #   or an existing <repo>/anthropic-config)
+
+# rootfs isolation (start-vm.sh) — each VM gets its own writable bytes
+ROOTFS_MODE=overlay ./start-vm.sh          # read-only shared base + per-VM overlay layer
+ROOTFS_MODE=copy ./start-vm.sh             # per-VM copy of the base (no initrd needed)
+ROOTFS_MODE=shared ./start-vm.sh           # old behavior: write the shared image (unsafe)
+OVERLAY_SIZE_MIB=4096 ./start-vm.sh        # size of this VM's writable layer (default 2048)
+RESET_LAYER=1 ./start-vm.sh                # discard this VM's writable bytes first
+INITRD=/path/to/initrd-overlay.img ./start-vm.sh
+PER_VM_KEY=0 ./start-vm.sh                 # reuse guest.id_rsa instead of this VM's own key
 
 # network policy (start-vm.sh; applied to the whole fc-nat table)
 GUEST_LAN_ACCESS=1 ./start-vm.sh           # let guests reach RFC1918 (default: blocked)
 GUEST_HOST_PORTS=2049,8080 ./start-vm.sh   # host ports guests may reach (default: 2049)
 GUEST_HOST_PORTS=2049,111 ./start-vm.sh    # ...add rpcbind if an NFS mount ever needs it
 GUEST_HOST_FILTER=0 ./start-vm.sh          # disable guest->host filtering entirely
+GUEST_EGRESS_ALLOW=api.anthropic.com,registry.npmjs.org ./start-vm.sh
+                                           # allowlist guest egress, drop the rest
+                                           #   (default: unset = unrestricted)
+GUEST_EGRESS_DNS=1.1.1.1 ./start-vm.sh     # resolvers reachable while the allowlist is on
+                                           #   (default 1.1.1.1,8.8.8.8)
 
 # download integrity (update-firecracker.sh)
 STRICT_PINS=1 ./update-firecracker.sh agent      # any pin change is fatal, incl. the installer
@@ -124,6 +139,29 @@ Notes:
 - `VCPU_COUNT` (>= 1) and `MEM_SIZE_MIB` (>= 128) are validated and rejected
   if not integers; Firecracker has no memory or vCPU hot-plug, so a running VM
   keeps the profile it booted with (`./list-vms.sh` shows it).
+- `ROOTFS_MODE` defaults to `auto`: `overlay` when `initrd-overlay.img` exists,
+  otherwise `copy`. Either way a VM never shares writable bytes with another —
+  booting off an image some other VM already has attached is refused, and in
+  `overlay` mode an unclean base is refused too, because a read-only mount
+  cannot replay an ext4 journal (`e2fsck -fy` it on the host).
+- `SSH_KEY` still overrides the key, and in `overlay`/`copy` mode its public
+  half (`$SSH_KEY.pub`) is installed in that VM instead of a generated one.
+  Otherwise each VM gets `guest-vm<id>.id_rsa`, created on first boot;
+  `stop-vm.sh` and `share-dir.sh` resolve the same key.
+- `GUEST_EGRESS_ALLOW` resolves hostnames **on the host, when the ruleset is
+  built**. For CDN-fronted names the address set rotates, so it bounds where a
+  guest can dial rather than guaranteeing an allowed name keeps resolving.
+- There is one `fc-nat` table for all VMs, so the allowlist is **host-wide and
+  remembered** in `.fc-egress-policy`: `stop-vm.sh` rebuilds the same table, and
+  without the remembered policy stopping one VM would silently restore open
+  egress for every VM still running. It is forgotten when the last VM stops, or
+  immediately if you pass an empty `GUEST_EGRESS_ALLOW=`. Pass it again on a
+  later `start-vm.sh` to change it.
+- An allowlisted address inside RFC1918/CGNAT is dropped by the `no guest->LAN`
+  rule *before* the allowlist is consulted; `start-vm.sh` warns rather than
+  letting it look effective. `GUEST_LAN_ACCESS=1` if you mean it.
+- `./list-vms.sh` has a `ROOTFS` column: `overlay:<layer>` means a read-only
+  base plus that VM's own layer; `rw:<image>` means a writable root.
 
 ## Layout
 
@@ -160,6 +198,8 @@ ubuntu-latest.id_rsa       # -> guest.id_rsa
 fc-vm*.log                 # per-VM serial console logs (mode 0600)
 .known_hosts               # TOFU guest host keys; deleted on an images rebuild
 .fw-forward-added          # marker: we enabled firewalld intra-zone forwarding
+.fc-egress-policy          # the egress allowlist in force (survives stop-vm.sh; see
+                           #   GUEST_EGRESS_ALLOW). Removed when the last VM stops.
 ```
 
 ## Architecture notes

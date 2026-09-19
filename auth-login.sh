@@ -17,14 +17,35 @@
 # - Keeping the guest on its own profile means host-side `ant` usage can never
 #   compete for (and rotate away) the guest's refresh token.
 #
-# anthropic-config/ contains live refresh tokens — it is gitignored; treat as secret.
+# The config dir contains live refresh tokens — treat as secret. It defaults to
+# ~/.config/anthropic-fc (outside this repo, so it cannot be swept into an NFS
+# export of the toolchain); a pre-existing ./anthropic-config is still honored
+# and is gitignored.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FC_DIR="${FC_DIR:-$SCRIPT_DIR}"
 PROFILE="${AGENT_PROFILE:-fc-agents}"
-CONFIG_DIR="${ANTHROPIC_CONFIG_DIR:-$FC_DIR/anthropic-config}"
+# Where the profile lives. Default is OUTSIDE the repo: a credential dir next
+# to the rootfs and the guest SSH key is one `SHARE_DIR=$PWD` away from being
+# NFS-exported to a guest. An existing repo-local dir keeps being
+# used — silently switching would orphan the live refresh token (they rotate on
+# renewal, so a second copy invalidates the first). Migration is a plain `mv`.
+CONFIG_DIR_DEFAULT="${XDG_CONFIG_HOME:-$HOME/.config}/anthropic-fc"
+LEGACY_CONFIG_DIR="$FC_DIR/anthropic-config"
+if [ -n "${ANTHROPIC_CONFIG_DIR:-}" ]; then
+  CONFIG_DIR="$ANTHROPIC_CONFIG_DIR"
+elif [ -d "$LEGACY_CONFIG_DIR" ]; then
+  CONFIG_DIR="$LEGACY_CONFIG_DIR"
+  echo "==> note: using the repo-local credential dir $CONFIG_DIR" >&2
+  echo "    It sits beside the rootfs and guest SSH key. To move it out (no VM running):" >&2
+  echo "        mv '$LEGACY_CONFIG_DIR' '$CONFIG_DIR_DEFAULT'" >&2
+  echo "        ./share-dir.sh <id> '$CONFIG_DIR_DEFAULT' /root/.config/anthropic" >&2
+  echo "    (one copy only — refresh tokens rotate)" >&2
+else
+  CONFIG_DIR="$CONFIG_DIR_DEFAULT"
+fi
 
 # --- locate (or install) ant --------------------------------------------------
 
@@ -63,7 +84,8 @@ cat <<EOF
   2. ./share-dir.sh 0 '$CONFIG_DIR' /root/.config/anthropic   # share the credentials (once)
   3. (optional) mkdir -p $FC_DIR/claude-sessions && ./share-dir.sh 0 '$FC_DIR/claude-sessions' /root/.claude
        # persists session transcripts to the host instead of the guest's ext4 rootfs
-  4. ssh -i $FC_DIR/guest.id_rsa -o UserKnownHostsFile=$FC_DIR/.known_hosts root@172.16.0.2
+  4. ssh -i $FC_DIR/guest-vm0.id_rsa -o UserKnownHostsFile=$FC_DIR/.known_hosts root@172.16.0.2
+       (start-vm.sh prints the exact command, including which key VM 0 was given)
        cd /workspace && ANTHROPIC_PROFILE=$PROFILE IS_SANDBOX=1 claude --dangerously-skip-permissions
 
     anthropic-config/ holds live refresh tokens: never commit it, never copy it

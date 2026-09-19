@@ -28,6 +28,12 @@
 #            dirs, token refreshes in anthropic-config) is owned by you on
 #            the host — no sudo needed to clean up, and a smaller blast
 #            radius than no_root_squash.
+#
+#            Refused outright: the toolchain directory (or any ancestor, or any
+#            copy carrying a guest SSH key) — the guest would be able to rewrite
+#            scripts the host runs under sudo, and to backdoor the rootfs and
+#            kernel every future VM boots. Guest-bound repo subdirs
+#            (anthropic-config/, claude-sessions/) remain shareable.
 # Guest side: over the existing SSH path: mkdir + mount -t nfs4 172.16.0.x:<hostdir>.
 #
 # NFS is stateless, so stop-vm.sh needs no changes; use --unmount to retire an
@@ -43,7 +49,6 @@ FC_DIR="${FC_DIR:-$SCRIPT_DIR}"
 # shellcheck source=lib-fcnet.sh
 source "$SCRIPT_DIR/lib-fcnet.sh"
 
-SSH_KEY="${SSH_KEY:-$FC_DIR/guest.id_rsa}"
 EXPORTS_FILE="/etc/exports.d/fc-agents.exports"
 # Guest root acts as the invoking host user on the export (see header comment).
 EXPORT_UID="$(id -u)"
@@ -68,6 +73,9 @@ VM_ID="$(fc_validate_vm_id "${ARGS[0]}")" || exit 1
 HOST_IP="$(fc_host_ip "$VM_ID")"
 GUEST_IP="$(fc_guest_ip "$VM_ID")"
 CLIENT="${GUEST_IP}/32"
+# This VM's key if it has one, else the shared key (SSH_KEY env wins — see
+# fc_ssh_key).
+SSH_KEY="$(fc_ssh_key "$VM_ID")"
 
 DIR="${ARGS[1]}"
 if [ "$UNMOUNT" = 1 ]; then
@@ -83,6 +91,11 @@ fi
 # /etc/exports has no quoting: a path with a space would export its PARENT, and
 # to an extra bogus "client" besides. Refuse rather than silently over-share.
 fc_reject_unsafe_path "$DIR" "host directory"
+# Toolchain-export guard. Share path only: --unmount must stay able
+# to retire pre-guard exports.
+if [ "$UNMOUNT" != 1 ]; then
+  fc_reject_toolchain_export "$DIR"
+fi
 MNT="${ARGS[2]:-/workspace}"
 case "$MNT" in /*) ;; *) echo "guest_mntpoint must be absolute: $MNT" >&2; exit 1 ;; esac
 fc_reject_unsafe_path "$MNT" "guest mountpoint"

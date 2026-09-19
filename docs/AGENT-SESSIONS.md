@@ -34,12 +34,18 @@ Two constraints shape the design:
 `auth-login.sh` wraps:
 
 ```bash
-ANTHROPIC_CONFIG_DIR=$PWD/anthropic-config ant auth login --profile fc-agents
+ANTHROPIC_CONFIG_DIR=~/.config/anthropic-fc ant auth login --profile fc-agents
 ```
 
 It installs `ant` via `go install github.com/anthropics/anthropic-cli/cmd/ant@latest`
-if missing. `anthropic-config/` holds **live refresh tokens** — it is gitignored;
-treat it as a secret.
+if missing. The config dir holds **live refresh tokens** — treat it as a secret.
+
+It lives **outside the repo** by default (`~/.config/anthropic-fc`): a credential
+dir sitting next to the rootfs, the kernel and the guest SSH key is one
+`SHARE_DIR=$PWD` away from being exported to a guest with all of them. An
+existing `./anthropic-config` keeps being used and is gitignored — switching
+silently would orphan the live refresh token, since tokens rotate on renewal and
+a second copy invalidates the first. `auth-login.sh` prints the `mv` to migrate.
 
 ## Per session
 
@@ -48,14 +54,15 @@ treat it as a secret.
 SHARE_DIR=~/my-project ./start-vm.sh
 
 # 2. share the credentials once (they land in the guest at /root/.config/anthropic)
-./share-dir.sh 0 "$PWD/anthropic-config" /root/.config/anthropic
+./share-dir.sh 0 ~/.config/anthropic-fc /root/.config/anthropic
 
 # 2b. (optional) share session transcripts too, so they persist on the host
 mkdir -p claude-sessions
 ./share-dir.sh 0 "$PWD/claude-sessions" /root/.claude
 
 # 3. run Claude Code inside the VM, in your host workspace
-ssh -t -i guest.id_rsa -o UserKnownHostsFile=.known_hosts root@172.16.0.2
+ssh -t -i guest-vm0.id_rsa -o UserKnownHostsFile=.known_hosts root@172.16.0.2
+     # start-vm.sh prints this line with the key that VM was actually given
      # then: cd /workspace && ANTHROPIC_PROFILE=fc-agents IS_SANDBOX=1 claude --dangerously-skip-permissions
 ```
 
@@ -95,9 +102,10 @@ config dir (`--bg` sessions are refused until an interactive session has
 accepted it).
 
 **Session transcripts (2b).** Without this mount, Claude Code inside the guest
-writes its transcripts to `/root/.claude/projects/*.jsonl` on the guest's own
-ext4 rootfs — persistent across guest reboots, but invisible to the host and
-lost on the next `images`/`agent` rebuild. Mounting it out to `claude-sessions/`
+writes its transcripts to `/root/.claude/projects/*.jsonl` inside the guest's own
+writable layer (`vm<id>-layer.ext4`) — persistent across guest reboots, but
+invisible to the host, destroyed by `RESET_LAYER=1`, and not carried across an
+`images`/`agent` rebuild. Mounting it out to `claude-sessions/`
 puts it on the host at `claude-sessions/projects/*/*.jsonl`, same shape as the
 native `~/.claude/projects`, so token-usage tooling that reads that layout
 (e.g. a cost estimator) can point `--root claude-sessions/projects` at it. It's
@@ -127,7 +135,7 @@ enforcing, exporting a directory under `/home` also enables the
 
 **Each export is scoped to one VM** (`172.16.0.2/32`), not to the
 `172.16.0.0/24` range. A subnet-wide export would let any VM mount every other
-VM's shares — including `anthropic-config/` and its live refresh tokens. Sharing
+VM's shares — including the credential dir and its live refresh tokens. Sharing
 one directory with several VMs is still supported and gets one client entry per
 VM on the same export line, which is how NFS expresses it:
 
