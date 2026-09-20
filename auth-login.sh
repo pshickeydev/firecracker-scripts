@@ -34,9 +34,13 @@ PROFILE="${AGENT_PROFILE:-fc-agents}"
 # renewal, so a second copy invalidates the first). Migration is a plain `mv`.
 CONFIG_DIR_DEFAULT="${XDG_CONFIG_HOME:-$HOME/.config}/anthropic-fc"
 LEGACY_CONFIG_DIR="$FC_DIR/anthropic-config"
+# A profile's refresh token lives at <config dir>/credentials/<profile>.json;
+# its presence in the default dir means the legacy dir is a stale leftover, not
+# the live credential store.
+DEFAULT_TOKEN_FILE="$CONFIG_DIR_DEFAULT/credentials/$PROFILE.json"
 if [ -n "${ANTHROPIC_CONFIG_DIR:-}" ]; then
   CONFIG_DIR="$ANTHROPIC_CONFIG_DIR"
-elif [ -d "$LEGACY_CONFIG_DIR" ]; then
+elif [ -d "$LEGACY_CONFIG_DIR" ] && [ ! -f "$DEFAULT_TOKEN_FILE" ]; then
   CONFIG_DIR="$LEGACY_CONFIG_DIR"
   echo "==> note: using the repo-local credential dir $CONFIG_DIR" >&2
   echo "    It sits beside the rootfs and guest SSH key. To move it out (no VM running):" >&2
