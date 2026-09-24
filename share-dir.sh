@@ -35,6 +35,13 @@
 #            kernel every future VM boots. Guest-bound repo subdirs
 #            (anthropic-config/, claude-sessions/) remain shareable.
 # Guest side: over the existing SSH path: mkdir + mount -t nfs4 172.16.0.x:<hostdir>.
+#            Refuses if the mountpoint is already a mountpoint of a DIFFERENT
+#            source (see the guest-mount section) — that would silently
+#            validate the old mount as the new share.
+#
+# --unmount finds the guest mount by NFS source (HOST_IP:dir), so the
+# guest mountpoint argument is optional for it and may be omitted even when
+# the share was mounted somewhere other than the default /workspace.
 #
 # NFS is stateless, so stop-vm.sh needs no changes; use --unmount to retire an
 # export cleanly. The nfs-server service stays enabled (shared by every VM).
@@ -284,15 +291,36 @@ host_unexport() {
 
 if [ "$UNMOUNT" = 1 ]; then
   if guest_alive; then
-    if guest "mountpoint -q '$MNT'"; then
-      echo "==> guest: unmounting $HOST_IP:$DIR from $MNT"
-      guest "umount '$MNT'" || {
-        echo "umount failed (busy?). Processes holding it:" >&2
-        guest "grep '$MNT' /proc/*/cwd /proc/*/root 2>/dev/null" || true
-        exit 1
-      }
+    # Find the actual mountpoint(s) by NFS SOURCE, not by the (possibly
+    # defaulted) MNT argument: shares are routinely mounted somewhere other
+    # than /workspace (e.g. /root/.claude), and a bare `--unmount <VM> <dir>`
+    # would otherwise default to /workspace, miss the real mount, and drop the
+    # export out from under a still-live guest mount. An explicitly passed
+    # MNT is included too (covers mounts whose recorded source differs).
+    SRC="$HOST_IP:$DIR"
+    declare -A TARGETS=() # tgt -> its actual nfs4 source (may differ from SRC
+    #                      # when matched via an explicitly passed MNT)
+    # findmnt -rn separates columns with a space (not a tab) — split on
+    # both so either output format parses.
+    while IFS=$' \t' read -r tgt src; do
+      [ -n "${tgt:-}" ] || continue
+      if [ "$src" = "$SRC" ] || { [ -n "${ARGS[2]:-}" ] && [ "$tgt" = "$MNT" ]; }; then
+        TARGETS["$tgt"]="$src"
+      fi
+    done < <(guest "findmnt -rn -t nfs4 -o TARGET,SOURCE" </dev/null 2>/dev/null || true)
+    if [ "${#TARGETS[@]}" -gt 0 ]; then
+      # Deepest paths first, so nested mounts unmount cleanly. while-read (not
+      # for-in) so a target containing whitespace is not word-split.
+      while read -r tgt; do
+        echo "==> guest: unmounting ${TARGETS["$tgt"]} from $tgt"
+        guest "umount '$tgt'" </dev/null || {
+          echo "umount failed (busy?). Processes holding it:" >&2
+          guest "grep '$tgt' /proc/*/cwd /proc/*/root 2>/dev/null" </dev/null || true
+          exit 1
+        }
+      done < <(printf '%s\n' "${!TARGETS[@]}" | awk '{print length, $0}' | sort -rn | cut -d' ' -f2-)
     else
-      echo "==> guest: $MNT is not a mountpoint (nothing to do)"
+      echo "==> guest: no NFS mount of $SRC found (nothing to do)"
     fi
   else
     # Unreachable guest (stopped or crashed): nothing holds a mount any more,
@@ -325,7 +353,27 @@ if ! guest "test -x /sbin/mount.nfs -o -x /usr/sbin/mount.nfs"; then
 fi
 
 if guest "mountpoint -q '$MNT'"; then
-  echo "==> guest: $MNT is already a mountpoint (leaving it as-is)"
+  # "Already a mountpoint" is only a no-op if it is OUR export. A different
+  # NFS source (or any other filesystem) mounted there means a second host
+  # dir is being pointed at a path an existing share already occupies — and
+  # the write test below would silently validate the OLD mount and report
+  # THIS share as live. Refuse instead, and suggest --unmount, which finds
+  # the real mountpoint by source so no path guessing is needed.
+  CUR_SRC="$(guest "findmnt -rn -t nfs4 -o SOURCE --target '$MNT'" </dev/null 2>/dev/null || true)"
+  if [ "$CUR_SRC" = "$HOST_IP:$DIR" ]; then
+    echo "==> guest: $MNT already mounts $CUR_SRC (leaving it as-is)"
+  else
+    echo "refusing: $MNT is already a mountpoint of ${CUR_SRC:-<not an NFSv4 mount>}," >&2
+    echo "    not $HOST_IP:$DIR. Retire the existing share first — --unmount finds" >&2
+    echo "    its guest mountpoint(s) by source, no argument guessing needed:" >&2
+    if [ -n "$CUR_SRC" ]; then
+      echo "        ./share-dir.sh --unmount $VM_ID '${CUR_SRC#*:}'" >&2
+    else
+      echo "        (whatever is mounted at $MNT is not one of this script's NFS" >&2
+      echo "         shares — unmount it inside the guest by hand)" >&2
+    fi
+    exit 1
+  fi
 else
   echo "==> guest: mounting $HOST_IP:$DIR at $MNT"
   guest "mkdir -p '$MNT' && mount -t nfs4 '$HOST_IP:$DIR' '$MNT'"

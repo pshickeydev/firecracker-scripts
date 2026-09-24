@@ -133,6 +133,13 @@ whose host directory no longer exists, and — if firewalld is active — allows
 enforcing, exporting a directory under `/home` also enables the
 `nfs_home_dirs` boolean. Guest side it mounts `172.16.0.1:<hostdir>` over SSH.
 
+If the guest mountpoint is already a mountpoint of a *different* NFS export
+(or any other filesystem), the share is **refused** rather than silently
+validated against the old mount — the write test would otherwise rubber-stamp
+the wrong export and report the new share as live. Retire the existing share
+first (`--unmount` finds its mountpoint by source, so no argument guessing
+needed), or unmount a non-script mount by hand inside the guest.
+
 **Each export is scoped to one VM** (`172.16.0.2/32`), not to the
 `172.16.0.0/24` range. A subnet-wide export would let any VM mount every other
 VM's shares — including the credential dir and its live refresh tokens. Sharing
